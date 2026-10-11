@@ -1,0 +1,86 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * Centralised file-level custom errors shared by every Quantum Ark contract.
+ *
+ * File-level errors keep duplicated revert-string data out of the deployed
+ * bytecode, which matters more here than on Ethereum: an ML-DSA-87 signature
+ * plus public key adds ~7.2KB to every Zond transaction, so creation code above
+ * ~18KB can no longer be deployed in a single request.
+ */
+
+/// A zero address was supplied where a live account or contract is required.
+error ZeroAddress();
+
+/// A zero value was supplied where a non-zero amount or identifier is required.
+error ZeroValue();
+
+/// The commitment preimage revealed at redemption time is past its deadline.
+error AttestationExpired(uint64 deadline, uint64 currentTime);
+
+/// No attester has committed to the revealed preimage.
+error UnknownCommitment(bytes32 commitment);
+
+/// The commitment was already redeemed; replay is rejected.
+error CommitmentAlreadyConsumed(bytes32 commitment);
+
+/// The commitment is already pending and cannot be committed twice.
+error CommitmentAlreadyExists(bytes32 commitment);
+
+/// A consumed commitment can no longer be revoked by its attester.
+error CommitmentNotRevocable(bytes32 commitment);
+
+/// The supplied Merkle proof does not reconstruct the sealed epoch root.
+error InvalidMerkleProof();
+
+/// No Merkle root has been sealed for the requested epoch.
+error UnknownEpoch(uint256 epoch);
+
+/// Epoch roots are write-once and cannot be overwritten.
+error EpochAlreadySealed(uint256 epoch);
+
+/// The revealed attestation names a different claimant than the caller expects.
+error ClaimantMismatch(address expected, address provided);
+
+/// The revealed attestation describes a different asset than the one claimed.
+error AssetHashMismatch(bytes32 expected, bytes32 provided);
+
+/// The burn proof blob could not be decoded into a BurnAttestation.
+error MalformedBurnProof();
+
+/// A policy already exists for the supplied cross-chain asset hash.
+error PolicyAlreadyExists(bytes32 ethAssetHash);
+
+/// No policy has been registered for the supplied cross-chain asset hash.
+error PolicyNotFound(bytes32 ethAssetHash);
+
+/// The policy is not in a status that permits the requested transition.
+error InvalidPolicyStatus(bytes32 ethAssetHash, uint8 currentStatus);
+
+/// The caller is not the immutable QRL beneficiary pinned to the policy.
+error NotBoundOwner(address boundQrlOwner, address caller);
+
+/// Neither the policy timelock nor a Q-Day declaration has unlocked the claim.
+error ClaimNotUnlocked(uint64 timelockExpiry, uint64 currentTime);
+
+/// The requested timelock duration falls outside the configured bounds.
+error TimelockOutOfRange(uint64 provided, uint64 minimum, uint64 maximum);
+
+/// Q-Day has already been declared and the declaration is irreversible.
+error QDayAlreadyDeclared();
+
+/// The native premium attached to the call does not match the tier tariff.
+error IncorrectPremium(uint256 required, uint256 provided);
+
+/// The treasury balance is insufficient for the requested withdrawal.
+error InsufficientTreasury(uint256 available, uint256 requested);
+
+/// A native value transfer failed at the recipient.
+error TransferFailed(address recipient, uint256 amount);
+
+/// A twin has already been issued for this origin-chain asset.
+error TwinAlreadyIssued(bytes32 ethAssetHash, uint256 twinTokenId);
+
+/// The queried token identifier has never been minted.
+error UnknownToken(uint256 tokenId);

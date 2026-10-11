@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../interfaces/IArkFlow.hyp";
+import "../utils/ArkFlowReceiver.hyp";
+
+/// Test-only. A receiver with the three lane shapes the real contracts will have.
+contract FlowSink is ArkFlowReceiver {
+    bool public frozen;
+    uint256 public ceiling = type(uint256).max;
+    bool public insuranceOpen;
+    uint256 public credited;
+
+    function setFrozen(bool v) external {
+        frozen = v;
+    }
+
+    function setCeiling(uint256 v) external {
+        ceiling = v;
+    }
+
+    function setInsuranceOpen(bool v) external {
+        insuranceOpen = v;
+    }
+
+    function _lane(bytes32 lane) internal view override returns (LaneInfo memory info) {
+        if (lane == ArkLanes.CUSHION) {
+            // One-way and defensive: open in a freeze, bounded by a ceiling.
+            uint256 held = _received(lane);
+            uint256 room = held >= ceiling ? 0 : ceiling - held;
+            info = LaneInfo({declared: true, open: room > 0, oneWay: true, defensive: true, room: room});
+        } else if (lane == ArkLanes.TREASURY_QURRL_PRIMARY) {
+            info = LaneInfo({declared: true, open: !frozen, oneWay: false, defensive: false, room: type(uint256).max});
+        } else if (lane == ArkLanes.TREASURY_INSURANCE) {
+            info = LaneInfo({declared: true, open: insuranceOpen && !frozen, oneWay: false, defensive: false, room: type(uint256).max});
+        }
+    }
+
+    function _onDeposit(bytes32, address, uint256 amount, bytes32) internal override {
+        credited += amount;
+    }
+}
+
+/// Test-only. Calls ArkFlowSend.push and reports what went.
+contract FlowSender {
+    event Pushed(uint256 sent);
+
+    function push(address receiver, bytes32 lane, bytes32 ref, uint256 amount) external payable returns (uint256 sent) {
+        sent = ArkFlowSend.push(receiver, lane, ref, amount);
+        emit Pushed(sent);
+    }
+
+    receive() external payable {}
+}
+
+/// Test-only. Not a flow receiver at all: reverts on everything.
+contract NotAReceiver {
+    function laneInfo(bytes32) external pure {
+        revert("no");
+    }
+}

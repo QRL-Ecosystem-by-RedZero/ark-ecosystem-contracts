@@ -1,0 +1,84 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The ecosystem phase (`QuantumArk-Phases.md` §2-3, adopted 2026-10-07): one
+ * index, 0 to 4, that every product reads to pick its row of a per-phase
+ * coefficient table compiled in at deployment.
+ *
+ *   0 Genesis Inventory   1 Lattice Shift   2 Classical Sunset   3 Q-Day   4 Restoration
+ *
+ * One `ArkPhase` per QRL network, governed by ArkTimelock. Implemented in
+ * contracts/core; Ark Staking (`ArkStakeParams`) reads it through this
+ * interface, Qurrl will.
+ *
+ * THE READ RULE
+ * -------------
+ * `phase()` is 3 while `ArkQDayOracle.declared()` and the stored phase is
+ * below 3; otherwise it is the stored phase. A stored 4 (Restoration) is never
+ * pulled back to 3 by the declaration, which stays true for good: there is no
+ * 4 -> 3 in v1 (Phases doc §8, R3).
+ *
+ * TRANSITIONS (each effective at the next epoch boundary, one at a time)
+ * ---------------------------------------------------------------------
+ *   setPhase   0 <-> 1 <-> 2, one step, at most one per epoch; 30 days, objectable
+ *   enterQDay  stored 0-2 -> 3; 48 hours. Defensive only: opens no payout
+ *   restore    3 -> 4, one-way; 30 days, objectable, kind EcosystemRestoration
+ * Nothing moves a phase in force of 3 or 4 back below 3.
+ */
+interface IArkPhase {
+    event PhaseScheduled(uint8 indexed fromPhase, uint8 indexed toPhase, uint256 effectiveEpoch);
+    event QDayEntered(uint8 indexed fromPhase, uint256 effectiveEpoch);
+    event Restored(bytes32 indexed evidenceHash, uint256 effectiveEpoch);
+    /// The incumbent named `proposed` as its successor. Zero withdraws a proposal.
+    event GovernanceProposed(address indexed current, address indexed proposed);
+    /// The proposed account accepted; `next` is governance from this call on.
+    event GovernanceTransferred(address indexed previous, address indexed next);
+
+    /// The caller is not `governance`.
+    error OnlyGovernance(address caller);
+    /// Only the account governance proposed may accept it.
+    error NotPendingGovernance(address caller);
+    /// The epoch length is zero.
+    error EpochLengthZero();
+    /// `fromPhase` is not the stored phase in force.
+    error PhaseMismatch(uint8 stored, uint8 fromPhase);
+    /// `setPhase` moves one step within 0..2 only.
+    error PhaseStep(uint8 fromPhase, uint8 toPhase);
+    /// A transition was already scheduled in this epoch.
+    error PhaseAlreadyStepped(uint256 epoch);
+    /// A transition is scheduled and not yet in force.
+    error PhasePending(uint8 toPhase, uint256 effectiveEpoch);
+    /// The phase in force is 3 or 4: only `restore` moves it, and only from 3.
+    error PhaseLocked(uint8 phaseInForce);
+    /// `restore` needs the phase in force to be 3.
+    error NotQDay(uint8 phaseInForce);
+    /// `restore` needs the hash of the hardfork evidence.
+    error EvidenceRequired();
+
+    function phase() external view returns (uint8);                 // phase in force now (0..4)
+    function phaseAt(uint256 epoch) external view returns (uint8);  // phase in force at an epoch boundary, same override rule
+    function pendingPhase() external view returns (uint8 toPhase, uint256 effectiveEpoch); // (0,0) when none pending
+    function phaseEnteredEpoch() external view returns (uint256);   // epoch at which the phase in force began (0 = deployment phase 0)
+    function epochLength() external view returns (uint256);         // seconds; Ark Staking checks it equals its ArkEpoch length
+    function qdayOracle() external view returns (address);
+    function governance() external view returns (address);          // ArkTimelock
+    function setPhase(uint8 fromPhase, uint8 toPhase) external;     // only governance
+    function enterQDay(uint8 fromPhase) external;                   // only governance
+    function restore(bytes32 evidenceHash) external;                // only governance
+
+    /// The stored phase in force now, without the Q-Day override.
+    function storedPhase() external view returns (uint8);
+
+    /// The epoch in progress: `block.timestamp / epochLength()`.
+    function currentEpoch() external view returns (uint256);
+
+    /// The account proposed and not yet accepted; zero when none.
+    function pendingGovernance() external view returns (address);
+
+    /// Governance only. Name a successor, or zero to withdraw a proposal.
+    function proposeGovernance(address next) external;
+
+    /// The proposed account only. Completes the handover.
+    function acceptGovernance() external;
+}

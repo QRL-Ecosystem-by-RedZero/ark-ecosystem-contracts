@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The epoch clock of the governance stack: a byte-for-byte mirror of the
+ * constants in `contracts/staking/contracts/utils/ArkEpoch.hyp`.
+ *
+ * Voting rounds, parameter effect and pricing share one clock (design N5), so a
+ * round opens on the same boundary at which a parameter it passes takes effect
+ * in Ark Staking. Mirrored rather than imported: contract repositories do not
+ * depend on each other's source, and the clock is two constants plus integer
+ * division. Epochs are numbered from the Unix epoch, so two contracts deployed
+ * at different moments agree without configuration.
+ */
+library ArkEpoch {
+    uint64 internal constant EPOCH_LENGTH = 7 days;
+
+    function current() internal view returns (uint256) {
+        return block.timestamp / EPOCH_LENGTH;
+    }
+
+    function epochOf(uint256 timestamp) internal pure returns (uint256) {
+        return timestamp / EPOCH_LENGTH;
+    }
+
+    function startOf(uint256 epoch) internal pure returns (uint256) {
+        return epoch * EPOCH_LENGTH;
+    }
+
+    /// The boundary at or before `timestamp`.
+    function floor(uint256 timestamp) internal pure returns (uint256) {
+        return (timestamp / EPOCH_LENGTH) * EPOCH_LENGTH;
+    }
+}

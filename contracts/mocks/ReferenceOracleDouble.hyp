@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../utils/ArkEpoch.hyp";
+
+/// The guardian of the timelock that governs the oracle.
+interface IOracleDoubleTimelock {
+    function guardian() external view returns (address);
+}
+
+/**
+ * Test double of the governance surface of contracts/staking's
+ * ArkReferenceOracle (yellow paper §6.1, technical reference §1.4, §3.7):
+ * the reporter set behind `governance`, and the pause rule. The guardian of
+ * the governing timelock pauses for `pauseMaxEpochs` epochs where no pause is
+ * in force; only `governance` renews a pause in force; a renounced guardian
+ * (stage S3) leaves no pause. Its parameters are tested through ParamsDouble,
+ * whose keyed diff is the same payload. Never deployed by a script.
+ */
+contract ReferenceOracleDouble {
+    address public governance;
+    uint256 public pauseMaxEpochs;
+    uint64 public pausedUntil;
+    uint256 public reporterCount;
+    // Private behind an explicit view: hypc's QRVM auto-getter misreads an address key (OC-V3-02).
+    mapping(address => bool) private _isReporter;
+
+    error OnlyGovernance(address caller);
+    error ReporterKnown(address reporter);
+    error NotReporter(address reporter);
+    error NoPause();
+    error NotGuardian(address caller);
+    error PauseInForce(uint64 until);
+
+    event Paused(address indexed by, uint64 until);
+
+    constructor(address governance_, uint256 pauseMaxEpochs_) {
+        governance = governance_;
+        pauseMaxEpochs = pauseMaxEpochs_;
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    function addReporter(address reporter) external onlyGovernance {
+        if (_isReporter[reporter]) revert ReporterKnown(reporter);
+        _isReporter[reporter] = true;
+        reporterCount += 1;
+    }
+
+    function removeReporter(address reporter) external onlyGovernance {
+        if (!_isReporter[reporter]) revert NotReporter(reporter);
+        _isReporter[reporter] = false;
+        reporterCount -= 1;
+    }
+
+    function isReporter(address reporter) external view returns (bool) {
+        return _isReporter[reporter];
+    }
+
+    function guardian() public view returns (address) {
+        if (governance.code.length == 0) return address(0);
+        try IOracleDoubleTimelock(governance).guardian() returns (address g) {
+            return g;
+        } catch {
+            return address(0);
+        }
+    }
+
+    function paused() external view returns (bool) {
+        return block.timestamp < uint256(pausedUntil);
+    }
+
+    function pause() external {
+        address g = guardian();
+        if (g == address(0)) revert NoPause();
+        uint64 until = pausedUntil;
+        bool inForce = block.timestamp < uint256(until);
+        if (msg.sender == g) {
+            if (inForce) revert PauseInForce(until);
+        } else if (msg.sender != governance || !inForce) {
+            revert NotGuardian(msg.sender);
+        }
+        until = uint64(block.timestamp + pauseMaxEpochs * uint256(ArkEpoch.EPOCH_LENGTH));
+        pausedUntil = until;
+        emit Paused(msg.sender, until);
+    }
+}

@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkPhase.hyp";
+import "./interfaces/IArkQDayOracle.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * ArkPhase — the ecosystem phase of Quantum Ark (`QuantumArk-Phases.md` §2-3,
+ * §7; implemented 2026-10-07). One per QRL network, part of the ecosystem
+ * layer beside ARK, veARK, the governor, the timelock and `ArkQDayOracle`.
+ * Every product compiles a row of coefficients per phase into its constructor
+ * and reads the row through `phase()` / `phaseAt(epoch)`, so one vote moves
+ * the coefficients of every product at the same boundary.
+ *
+ * THE READ RULE
+ * -------------
+ *   phase() = 3            if ArkQDayOracle.declared() and the stored phase < 3
+ *           = stored phase  otherwise
+ *
+ * Q-Day needs no transaction here: the oracle's declaration (5-of-9 bonded
+ * attesters, ratified by veARK) lifts every reader to 3 at once. A stored 4
+ * (Restoration) wins over the declaration, which stays true for good: without
+ * that, `restore` could never take effect. There is no 4 -> 3 in v1 (Phases
+ * doc §8, R3); a second quantum incident after Restoration has the oracle's
+ * advisory freeze only.
+ *
+ * THE EPOCH CLOCK
+ * ---------------
+ * `currentEpoch() = block.timestamp / epochLength`, numbered from the Unix
+ * epoch with no origin offset: the expression of `ArkEpoch.current()` in
+ * contracts/staking, whose length is seven days at the specification profile
+ * and scaled by the testnet profiles. `epochLength` is a constructor immutable
+ * (never zero) instead of a compiled constant, so one artifact serves every
+ * profile; Ark Staking checks it equals its own `ArkEpoch.EPOCH_LENGTH` when it
+ * is wired, and a mismatch would number the two clocks differently.
+ *
+ * EVERY TRANSITION IS SCHEDULED FOR THE NEXT BOUNDARY
+ * ---------------------------------------------------
+ * A call in epoch e writes the stored phase from epoch e + 1: products price an
+ * epoch at its opening boundary and never see a phase change inside one (the
+ * oracle's declaration excepted, for `phase()`; see `phaseAt`). Hence one
+ * transition at a time: while one is scheduled and not in force, a second is
+ * refused (`PhaseAlreadyStepped` for `setPhase`, which is also the one-step-
+ * per-epoch rule, `PhasePending` for the other two). A refused call through
+ * the timelock leaves its operation Queued; it can be executed again in the
+ * next epoch, within the timelock's grace.
+ *
+ * HISTORY
+ * -------
+ * Every stored transition is kept, `(phase, fromEpoch)` in order, from the
+ * deployment's `(0, 0)`. `phaseAt` is exact for every epoch, past or future
+ * (a future epoch reads the schedule as it stands). It scans back from the
+ * newest entry, so the epochs products ask for, the current and the previous
+ * one, cost one or two reads; an old epoch costs one read per later
+ * transition, at most one per epoch.
+ */
+contract ArkPhase is IArkPhase {
+    uint8 public constant GENESIS_INVENTORY = 0;
+    uint8 public constant LATTICE_SHIFT = 1;
+    uint8 public constant CLASSICAL_SUNSET = 2;
+    uint8 public constant QDAY = 3;
+    uint8 public constant RESTORATION = 4;
+
+    struct Entry {
+        uint8 phase;
+        uint64 fromEpoch;
+    }
+
+    /// ArkQDayOracle (`IArkQDayState`): `declared()` and `declaredAt()` are the only reads.
+    address public immutable qdayOracle;
+    /// Seconds per epoch; equals Ark Staking's `ArkEpoch.EPOCH_LENGTH` at the same profile.
+    uint256 public immutable epochLength;
+
+    /// ArkTimelock from S1 (contracts/core CLAUDE.md §3.3).
+    address public governance;
+    address public pendingGovernance;
+
+    /// Stored transitions, oldest first; entry 0 is the deployment's phase 0 from epoch 0.
+    Entry[] private _history;
+
+    constructor(address qdayOracle_, address governance_, uint256 epochLength_) {
+        if (qdayOracle_ == address(0) || governance_ == address(0)) revert ZeroAddress();
+        if (epochLength_ == 0) revert EpochLengthZero();
+        qdayOracle = qdayOracle_;
+        governance = governance_;
+        epochLength = epochLength_;
+        _history.push(Entry({phase: GENESIS_INVENTORY, fromEpoch: 0}));
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Reads                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function currentEpoch() public view returns (uint256) {
+        return block.timestamp / epochLength;
+    }
+
+    /// The phase in force now: 3 while declared and stored below 3, else the stored phase.
+    function phase() external view returns (uint8) {
+        uint8 s = storedPhase();
+        if (s < QDAY && IArkQDayState(qdayOracle).declared()) return QDAY;
+        return s;
+    }
+
+    /**
+     * The phase in force at the boundary that opens `epoch`.
+     *
+     * @dev The Q-Day override applies when the oracle's `declaredAt()` is at or
+     *      before that boundary, `declaredAt <= epoch * epochLength`: the
+     *      declaration had happened by the epoch's start. The boundary instant
+     *      itself counts, because a block stamped exactly at the boundary is
+     *      already in `epoch` and `phase()` there reads 3 as well.
+     *
+     *      So for the epoch in which the declaration lands, `phase()` reads 3
+     *      from the declaring block on while `phaseAt` of that epoch keeps the
+     *      stored phase; from the next boundary both read 3. A product that
+     *      prices an epoch at its opening boundary reads `phaseAt`, and a value
+     *      it read for a past boundary never changes after the fact. The
+     *      defensive paths that must react at once read `phase()` or the
+     *      oracle itself.
+     *
+     *      A stored 4 at `epoch` wins over the declaration, as in `phase()`.
+     */
+    function phaseAt(uint256 epoch) external view returns (uint8) {
+        uint8 s = _history[_indexAt(epoch)].phase;
+        if (s < QDAY && _declaredBy(epoch)) return QDAY;
+        return s;
+    }
+
+    /// @inheritdoc IArkPhase
+    function storedPhase() public view returns (uint8) {
+        return _history[_indexAt(currentEpoch())].phase;
+    }
+
+    /**
+     * The stored transition scheduled and not yet in force, or (0, 0).
+     *
+     * @dev The stored schedule as it stands: a `setPhase` scheduled before a
+     *      declaration in the same epoch still shows here, though the phase in
+     *      force stays 3 once it lands.
+     */
+    function pendingPhase() external view returns (uint8 toPhase, uint256 effectiveEpoch) {
+        Entry storage last = _history[_history.length - 1];
+        if (last.fromEpoch > currentEpoch()) return (last.phase, last.fromEpoch);
+    }
+
+    /**
+     * The first epoch from whose opening boundary the phase in force has held.
+     *
+     * @dev For a stored phase, the epoch its transition took effect (0 for the
+     *      deployment's phase 0). Under the Q-Day override, the first boundary
+     *      at or after `declaredAt()`: the first epoch `phaseAt` reads as 3. In
+     *      the epoch in which the declaration lands this is the current epoch
+     *      plus one, while `phase()` already reads 3.
+     */
+    function phaseEnteredEpoch() external view returns (uint256) {
+        Entry storage e = _history[_indexAt(currentEpoch())];
+        if (e.phase < QDAY && IArkQDayState(qdayOracle).declared()) {
+            return _ceilEpoch(IArkQDayState(qdayOracle).declaredAt());
+        }
+        return e.fromEpoch;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Transitions (governance: ArkTimelock)                               */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * One step between 0, 1 and 2, effective at the next epoch boundary.
+     *
+     * @dev Timelock row: 30 days, objectable at S1; governor kind
+     *      EcosystemPhase (10% / 66%). Refused while the phase in force is 3 or
+     *      4 (`PhaseLocked`): nothing leads back from Q-Day. `fromPhase` must be
+     *      the stored phase in force (`PhaseMismatch`), so a stale operation
+     *      fails instead of applying to a phase it was not voted against.
+     */
+    function setPhase(uint8 fromPhase, uint8 toPhase) external onlyGovernance {
+        uint256 c = currentEpoch();
+        uint8 s = _history[_indexAt(c)].phase;
+        uint8 r = _read(s);
+        if (r >= QDAY) revert PhaseLocked(r);
+        if (fromPhase != s) revert PhaseMismatch(s, fromPhase);
+        // `s` <= 2 here, so `fromPhase + 1` cannot overflow; `toPhase > 2` short-circuits first.
+        if (toPhase > CLASSICAL_SUNSET || (toPhase != fromPhase + 1 && toPhase + 1 != fromPhase)) {
+            revert PhaseStep(fromPhase, toPhase);
+        }
+        if (_history[_history.length - 1].fromEpoch > c) revert PhaseAlreadyStepped(c);
+        _schedule(s, toPhase, c);
+    }
+
+    /**
+     * The emergency step from a stored 0, 1 or 2 to 3, effective at the next
+     * epoch boundary.
+     *
+     * @dev DEFENSIVE ONLY. It turns on what products key to phase 3 — circuit
+     *      breakers, closed subscriptions, closed new positions — and opens NO
+     *      payout: Ark Staking's trigger-2 settlement and insurance claims keep
+     *      reading `ArkQDayOracle.declared()` alone, never this contract. A
+     *      vote can protect; only certified, ratified attesters can start a
+     *      payment (N4, G7). Timelock row: 48 hours (objectable at S1, so Leg B
+     *      and the guardian can stop a captured one, Phases doc R2); governor
+     *      kind EcosystemPhase (10% / 66%). Refused once the phase in force is
+     *      already 3 or 4.
+     */
+    function enterQDay(uint8 fromPhase) external onlyGovernance {
+        uint256 c = currentEpoch();
+        uint8 s = _history[_indexAt(c)].phase;
+        uint8 r = _read(s);
+        if (r >= QDAY) revert PhaseLocked(r);
+        if (fromPhase != s) revert PhaseMismatch(s, fromPhase);
+        _refusePending(c);
+        _schedule(s, QDAY, c);
+        emit QDayEntered(fromPhase, c + 1);
+    }
+
+    /**
+     * 3 -> 4, one-way, effective at the next epoch boundary, on the hash of
+     * the evidence that the classical chains have hard-forked to post-quantum
+     * signatures.
+     *
+     * @dev Only while the phase in force is 3, stored or by the oracle's
+     *      declaration (`NotQDay`). Timelock row: 30 days, objectable at S1;
+     *      governor kind EcosystemRestoration (20% / 75%). Once stored, 4 wins
+     *      over the declaration and nothing leads back to 3 in v1.
+     */
+    function restore(bytes32 evidenceHash) external onlyGovernance {
+        if (evidenceHash == bytes32(0)) revert EvidenceRequired();
+        uint256 c = currentEpoch();
+        uint8 r = _read(_history[_indexAt(c)].phase);
+        if (r != QDAY) revert NotQDay(r);
+        _refusePending(c);
+        _schedule(QDAY, RESTORATION, c);
+        emit Restored(evidenceHash, c + 1);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Governance handover (contracts/core CLAUDE.md §3.3)                 */
+    /* ------------------------------------------------------------------ */
+
+    /// @inheritdoc IArkPhase
+    function proposeGovernance(address next) external onlyGovernance {
+        pendingGovernance = next;
+        emit GovernanceProposed(governance, next);
+    }
+
+    /// @inheritdoc IArkPhase
+    function acceptGovernance() external {
+        address next = pendingGovernance;
+        // `next != 0` is implied: the zero address sends no transaction.
+        if (msg.sender != next) revert NotPendingGovernance(msg.sender);
+        emit GovernanceTransferred(governance, next);
+        governance = next;
+        pendingGovernance = address(0);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Internals                                                           */
+    /* ------------------------------------------------------------------ */
+
+    function _schedule(uint8 fromPhase, uint8 toPhase, uint256 c) private {
+        _history.push(Entry({phase: toPhase, fromEpoch: uint64(c + 1)}));
+        emit PhaseScheduled(fromPhase, toPhase, c + 1);
+    }
+
+    function _refusePending(uint256 c) private view {
+        Entry storage last = _history[_history.length - 1];
+        if (last.fromEpoch > c) revert PhasePending(last.phase, last.fromEpoch);
+    }
+
+    /// The read rule applied to a stored phase in force now.
+    function _read(uint8 s) private view returns (uint8) {
+        return s < QDAY && IArkQDayState(qdayOracle).declared() ? QDAY : s;
+    }
+
+    /// The newest entry in force at `epoch`. Entry 0 starts at epoch 0, so one always is.
+    function _indexAt(uint256 epoch) private view returns (uint256 i) {
+        i = _history.length - 1;
+        while (_history[i].fromEpoch > epoch) i--;
+    }
+
+    /// The oracle's declaration had happened by the boundary opening `epoch`.
+    function _declaredBy(uint256 epoch) private view returns (bool) {
+        uint64 at = IArkQDayState(qdayOracle).declaredAt();
+        return at != 0 && _ceilEpoch(at) <= epoch;
+    }
+
+    /// The first epoch whose opening boundary is at or after `timestamp`.
+    function _ceilEpoch(uint64 timestamp) private view returns (uint256) {
+        uint256 len = epochLength;
+        uint256 t = timestamp;
+        return t / len + (t % len == 0 ? 0 : 1);
+    }
+}

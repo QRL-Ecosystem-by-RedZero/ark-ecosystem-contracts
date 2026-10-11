@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "../interfaces/IArkStakeGovernable.hyp";
+import "../utils/ArkEpoch.hyp";
+
+/**
+ * Test doubles for the governance suite. Never deployed by a script.
+ *
+ * `ParamsDouble` models the target side the staking repository will implement
+ * (design §6.2 - §6.4): governance-gated, compare-and-swap per key, every range
+ * checked on the draft, the diff effective at the next epoch boundary, and the
+ * threat stage bound to its `fromStage`, one step, once per epoch. It is the
+ * minimum needed to test the core side of G1, G2, G8 and G9; the staking agent
+ * owns the real target and its own tests.
+ */
+contract ParamsDouble is IArkStakeGovernable {
+    struct Range {
+        uint256 lo;
+        uint256 hi;
+        bool known;
+    }
+
+    struct Pending {
+        uint256 value;
+        uint256 effectiveEpoch;
+        bool set;
+    }
+
+    address public governance;
+    address public pendingGovernance;
+    address private immutable _deployer;
+
+    mapping(bytes32 => Range) private _ranges;
+    mapping(bytes32 => uint256) private _inForce;
+    mapping(bytes32 => Pending) private _pending;
+
+    uint8 public threatStage = 1;
+    uint256 private _stageEpochPlusOne;
+
+    uint256 public lastValue;
+    bytes32 public lastValidator;
+
+    error OnlyGovernance(address caller);
+    error NotPendingGovernance(address caller);
+    error UnknownParam(bytes32 key);
+    error ExpectedMismatch(bytes32 key, uint256 expected, uint256 actual);
+    error OutOfRange(bytes32 key, uint256 value);
+    error StageMismatch(uint8 current, uint8 fromStage);
+    error StageStep(uint8 fromStage, uint8 toStage);
+    error StageAlreadyStepped(uint256 epoch);
+
+    event DiffScheduled(uint256 effectiveEpoch, uint256 changes);
+
+    constructor(address governance_) {
+        governance = governance_;
+        _deployer = msg.sender;
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    function defineParam(bytes32 key, uint256 lo, uint256 hi, uint256 value) external {
+        require(msg.sender == _deployer);
+        _ranges[key] = Range(lo, hi, true);
+        _inForce[key] = value;
+    }
+
+    function proposeGovernance(address next) external onlyGovernance {
+        pendingGovernance = next;
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance(msg.sender);
+        governance = msg.sender;
+        pendingGovernance = address(0);
+    }
+
+    function valueOf(bytes32 key) public view returns (uint256) {
+        Pending storage p = _pending[key];
+        if (p.set && ArkEpoch.current() >= p.effectiveEpoch) return p.value;
+        return _inForce[key];
+    }
+
+    /**
+     * Compare-and-swap against the LATEST scheduled value, pending included: a
+     * diff executed this epoch and effective at the next boundary is already
+     * what a second, parallel diff must have expected. Comparing with the value
+     * merely in force would let both land and the second silently undo the first.
+     */
+    function setParamsDiff(ParamChange[] calldata changes) external onlyGovernance {
+        uint256 effective = ArkEpoch.current() + 1;
+        for (uint256 i = 0; i < changes.length; i++) {
+            bytes32 k = changes[i].key;
+            Range storage r = _ranges[k];
+            if (!r.known) revert UnknownParam(k);
+            Pending storage p = _pending[k];
+            if (p.set && ArkEpoch.current() >= p.effectiveEpoch) _inForce[k] = p.value;
+            uint256 latest = p.set ? p.value : _inForce[k];
+            if (changes[i].expected != latest) revert ExpectedMismatch(k, changes[i].expected, latest);
+            if (changes[i].value < r.lo || changes[i].value > r.hi) revert OutOfRange(k, changes[i].value);
+            _pending[k] = Pending(changes[i].value, effective, true);
+        }
+        emit DiffScheduled(effective, changes.length);
+    }
+
+    function setThreatStage(uint8 fromStage, uint8 toStage) external onlyGovernance {
+        if (threatStage != fromStage) revert StageMismatch(threatStage, fromStage);
+        bool up = toStage == fromStage + 1 && toStage <= 4;
+        bool down = fromStage > 1 && toStage == fromStage - 1;
+        if (!up && !down) revert StageStep(fromStage, toStage);
+        uint256 epoch = ArkEpoch.current();
+        if (_stageEpochPlusOne == epoch + 1) revert StageAlreadyStepped(epoch);
+        _stageEpochPlusOne = epoch + 1;
+        threatStage = toStage;
+    }
+
+    function admitValidator(bytes calldata pubkey, bytes32, bytes32, address) external payable onlyGovernance {
+        lastValue = msg.value;
+        lastValidator = keccak256(pubkey);
+    }
+
+    function delistAsset(bytes32 key) external onlyGovernance {
+        lastValidator = key;
+    }
+}
+
+/// Leg B principal by holder, checkpointed per epoch (design §6.8).
+contract ObjectionSourceDouble {
+    mapping(address => mapping(uint256 => uint256)) private _principal;
+    mapping(uint256 => uint256) private _total;
+
+    function set(address holder, uint256 epoch, uint256 amount) external {
+        _total[epoch] = _total[epoch] - _principal[holder][epoch] + amount;
+        _principal[holder][epoch] = amount;
+    }
+
+    function principalAt(address holder, uint256 epoch) external view returns (uint256) {
+        return _principal[holder][epoch];
+    }
+
+    function totalPrincipalAt(uint256 epoch) external view returns (uint256) {
+        return _total[epoch];
+    }
+}
+
+/**
+ * The court's side of the terminal governance step (design §6.7). A case stays
+ * open — and in the real court its drawn jurors' stake stays held (G13) — until
+ * the governor resolves the escalation.
+ */
+contract CourtDouble {
+    address public governor;
+    // Private behind explicit views: hypc's QRVM auto-getter misreads a bytes32 key (OC-V3-02).
+    mapping(bytes32 => bool) private _escalationPending;
+    mapping(bytes32 => uint256) private _escalationLapsesAt;
+    mapping(bytes32 => bool) private _caseOpen;
+    mapping(bytes32 => uint8) private _outcome; // 1 uphold, 2 retrial
+
+    error OnlyGovernor(address caller);
+
+    function setGovernor(address g) external {
+        governor = g;
+    }
+
+    function escalationPending(bytes32 caseId) external view returns (bool) {
+        return _escalationPending[caseId];
+    }
+
+    function escalationLapsesAt(bytes32 caseId) external view returns (uint256) {
+        return _escalationLapsesAt[caseId];
+    }
+
+    function caseOpen(bytes32 caseId) external view returns (bool) {
+        return _caseOpen[caseId];
+    }
+
+    function outcome(bytes32 caseId) external view returns (uint8) {
+        return _outcome[caseId];
+    }
+
+    function escalate(bytes32 caseId) external {
+        _escalationPending[caseId] = true;
+        _caseOpen[caseId] = true;
+        _escalationLapsesAt[caseId] = block.timestamp + 14 days;
+    }
+
+    function setLapse(bytes32 caseId, uint256 lapsesAt) external {
+        _escalationLapsesAt[caseId] = lapsesAt;
+    }
+
+    function resolveEscalation(bytes32 caseId, bool retrial) external {
+        if (msg.sender != governor) revert OnlyGovernor(msg.sender);
+        _escalationPending[caseId] = false;
+        _escalationLapsesAt[caseId] = 0;
+        _outcome[caseId] = retrial ? 2 : 1;
+        // A retrial keeps the case open before a fresh panel; an uphold closes it.
+        _caseOpen[caseId] = retrial;
+    }
+}
+
+/**
+ * The three Q-Day views ArkPhase reads (`IArkQDayState`), set directly: the
+ * real oracle's declaration needs a certification and a governor vote, which
+ * `test/GovernanceSpec.test.js` drives end to end.
+ */
+contract QDayStateDouble {
+    bool public declared;
+    bool public frozen;
+    uint64 public declaredAt;
+
+    function declare(uint64 at) external {
+        declared = true;
+        frozen = true;
+        declaredAt = at;
+    }
+}

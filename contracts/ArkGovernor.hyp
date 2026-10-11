@@ -1,0 +1,724 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC20/IERC20.hyp";
+
+import "./interfaces/IArkGovernor.hyp";
+import "./interfaces/IArkGovernorRounds.hyp";
+import "./interfaces/IVeArk.hyp";
+import "./interfaces/IArkTimelock.hyp";
+import "./interfaces/IArkQDayOracle.hyp";
+import "./interfaces/IArkCourtEscalation.hyp";
+import "./interfaces/IObjectionSource.hyp";
+import "./ArkGovernorRules.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/// The live total VeArk exposes beside IVeArk; used only for the proposal threshold.
+interface IVeArkLive {
+    function totalWeight() external view returns (uint256);
+}
+
+/**
+ * ArkGovernor — voting rounds on the Ark Staking epoch clock (design §5, §6).
+ *
+ * THE GOVERNOR ONLY COUNTS (design N1)
+ * ------------------------------------
+ * It never checks a range (the target does), never chooses a delay (the
+ * timelock computes it) and never moves value. It reads weight from veARK at
+ * a snapshot, tallies, and hands succeeded actions to ArkTimelock.
+ *
+ * SNAPSHOTS ARE veARK'S (VeArk.hyp, in-place v2)
+ * ----------------------------------------------
+ * A snapshot is the block in which `VeArk.checkpoint()` ran: veARK records that
+ * block's timestamp beside the global totals, because a contract cannot read a
+ * past block's timestamp. A snapshot is therefore readable only from the NEXT
+ * block, so votes on a round, and on an off-round track, start one block after
+ * it was opened. Lock writes later in the opening block are inside the snapshot;
+ * a lock is at least 7 days and every vote pins it, so that buys nothing.
+ *
+ * ROUNDS
+ * ------
+ * A proposal made during epoch r is voted in round r+1 (QIP kinds: in the first
+ * round after the 7-day audit). `openRound` — permissionless — takes ONE
+ * snapshot for every proposal of the round, so a holder locks or delegates once
+ * per round. Voting lasts 5 days from the opening; if the
+ * pass/fail outcome flips in the last 24 hours the window grows by 24 hours,
+ * once. A Succeeded proposal must be queued within 14 days.
+ *
+ * OVERRIDE (design §4.4, G5)
+ * --------------------------
+ * A delegator x whose lock was delegated to d at the snapshot may vote in
+ * person with its own w_x(s). That weight is added to `_overridden[d]` and, if d
+ * already voted, taken out of d's choice; d votes with power(d, s) minus what
+ * was overridden, before or after. No unit of weight is counted twice, and
+ * bought delegation is never durable: the seller can always vote it back.
+ *
+ * PIN (G6)
+ * --------
+ * Every vote pins the voter in veARK until H = the latest possible vote end
+ * + the 14-day queue grace + the proposal's timelock delay + the timelock's
+ * 14-day execution grace + one epoch — an upper bound on when the decision
+ * takes effect (GV-02 added the two graces). A delegatee's pin binds its
+ * delegators. A delegatee
+ * votes with its snapshot power even after a delegator has left, so opening a
+ * round or an off-round track also tells veARK the window's latest vote end
+ * and its largest H (`holdDelegated`): delegated locks cannot leave, by
+ * withdrawal or re-delegation, ahead of a vote not yet cast. The round's
+ * largest H is booked as proposals join it; the set is closed when it opens.
+ *
+ * TWO OFF-ROUND TRACKS (design §5.6)
+ * ----------------------------------
+ *   Q-Day ratification  48 h, only on a 5-of-9 certification in ArkQDayOracle;
+ *                       ratified only if for >= Q_min (`qdayQuorumBps` of W)
+ *                       and for > against, rejected otherwise: nobody voting
+ *                       is a rejection (G10, OC-GOV-11). Q_min counts votes
+ *                       for, not turnout, so the rule stays monotone (GOV-11).
+ *                       Rejection lifts the freeze; the attesters may certify
+ *                       again in a new round. No timelock.
+ *   Court escalation    5 days, only on an escalation the court reports;
+ *                       10% / 66% orders a RETRIAL, anything else UPHOLDS.
+ * Neither can originate a payment from bond principal (N4, G7), and neither
+ * passes through the timelock, so the guardian cannot cancel them (G14).
+ *
+ * LEG B OBJECTION CHAMBER (decision D6)
+ * -------------------------------------
+ * While a value-transfer proposal (the stage, or any of the 39 keys with a step
+ * in ArkGovTables: the ladder, kappa, the premium, levy, reserve, solver bond,
+ * ops, run-off, buffer and batching keys, indemnity, loss floor, tranche, D0,
+ * S_floor; and since OC-GOV-01 a handover, `proposeGovernance`,
+ * `setObjectionSource` or `setCourt` — the set is `ArkTimelock.ruleFor`'s) sits
+ * queued, bond holders may object with the principal they held
+ * at the boundary opening the queue epoch. At the objection threshold the
+ * operations are cancelled and the proposal becomes Contested: it is voted
+ * again, once, at 15% quorum and 75% approval. This is the chamber from stage
+ * S2, when this contract is the timelock's proposer. At S1 (EC-06) the chamber
+ * is ArkTimelock's own: a contested multisig operation waits a second delay,
+ * cancellable by the guardian, and is not re-voted.
+ *
+ * UNCALIBRATED REFERENCE VALUES
+ * -----------------------------
+ * `proposalThresholdBps` (reference 10 = 0.1% of W), `qdayQuorumBps` (Q_min,
+ * reference 500 = 5% of W, compiled range 100..5000) and
+ * `objectionThresholdBps` (reference 2000 = 20% of principal) are constructor
+ * immutables because design §12 marks them uncalibrated: they need a model of
+ * the real ARK distribution before mainnet, and a redeploy of this contract —
+ * not a vote — is how they change. Q_min trades payout speed for safety: an
+ * apathetic or captured veARK can delay a payout until the attesters certify
+ * again, while the freeze protects from the advisory on (2026-10-09).
+ */
+contract ArkGovernor is IArkGovernorRounds {
+    uint64 public constant VOTING_PERIOD = 5 days;
+    uint64 public constant LATE_WINDOW = 24 hours;
+    uint64 public constant LATE_EXTENSION = 24 hours;
+    uint64 public constant QUEUE_GRACE = 14 days;
+    uint64 public constant QDAY_PERIOD = 48 hours;
+    uint64 public constant COURT_PERIOD = 5 days;
+    uint64 public constant AUDIT_PERIOD = 7 days;
+    /// ArkTimelock.GRACE_PERIOD: how long a queued operation stays executable.
+    uint64 private constant TIMELOCK_GRACE = 14 days;
+    /// H minus the opening and the delay (GV-02: both graces included).
+    uint64 private constant ROUND_REACH =
+        VOTING_PERIOD + LATE_EXTENSION + QUEUE_GRACE + TIMELOCK_GRACE + ArkEpoch.EPOCH_LENGTH;
+    uint256 public constant MAX_ACTIONS = 16;
+    uint16 public constant CONTESTED_QUORUM_BPS = 1500;
+    uint16 public constant CONTESTED_APPROVAL_BPS = 7500;
+    /// Compiled bounds of `qdayQuorumBps` (1% .. 50% of W).
+    uint16 public constant QDAY_QUORUM_MIN_BPS = 100;
+    uint16 public constant QDAY_QUORUM_MAX_BPS = 5000;
+
+    uint256 private constant BPS = 10000;
+    /// Mirrors ArkGovernorRules.TRACK_ROUND; read as a constant to save a call per use.
+    uint8 private constant TRACK_ROUND = 1;
+    uint8 private constant K_STAKING_THREAT_STAGE = 9;
+    uint8 private constant K_STAKING_QDAY = 13;
+    uint8 private constant K_STAKING_COURT = 14;
+
+    uint8 private constant S_LIVE = 1;
+    uint8 private constant S_QUEUED = 2;
+    uint8 private constant S_CANCELLED = 3;
+    uint8 private constant S_RESOLVED = 4;
+
+    IVeArk public immutable veArk;
+    IArkTimelock public immutable timelock;
+    ArkGovernorRules public immutable rules;
+    IERC20 public immutable ark;
+    IArkQDayOracle public immutable qday;
+    uint16 public immutable proposalThresholdBps;
+    uint16 public immutable qdayQuorumBps;
+    uint16 public immutable objectionThresholdBps;
+    uint256 public immutable admissionDeposit;
+
+    /// The Ark Staking court; set once through a 30-day timelock operation.
+    address public court;
+    /// Leg B principal (IObjectionSource); set once through a 30-day timelock operation.
+    address public objectionSource;
+
+    struct Round {
+        uint64 snapshot;
+        uint64 openedAt;
+    }
+
+    struct Proposal {
+        address proposer;
+        uint8 kind;
+        uint8 status;
+        uint8 attempt;
+        uint8 track;
+        bool extended;
+        bool valueTransfer;
+        bool passed;
+        bool strict;
+        uint16 quorumBps;
+        uint16 approvalBps;
+        uint64 round;
+        uint64 delay;
+        uint64 queueEpoch;
+        uint64 snapshot;
+        uint64 voteEnd;
+        uint256 deposit;
+        bytes32 subject;
+        uint256 forVotes;
+        uint256 againstVotes;
+        uint256 abstainVotes;
+        uint256 objection;
+    }
+
+    uint256 public proposalCount;
+    uint256 public liveStageProposal;
+
+    mapping(uint256 => Round) private _rounds;
+    /// round => largest (H - openedAt) over its proposals; zero while it has none.
+    mapping(uint256 => uint64) private _roundReach;
+    mapping(uint256 => Proposal) private _proposals;
+    mapping(uint256 => address[]) private _targets;
+    mapping(uint256 => uint256[]) private _values;
+    mapping(uint256 => bytes[]) private _payloads;
+    mapping(uint256 => bytes32[]) private _ops;
+
+    /// ballot = keccak256(id, attempt) => voter => support + 1.
+    mapping(bytes32 => mapping(address => uint8)) private _receipt;
+    mapping(bytes32 => mapping(address => uint256)) private _overridden;
+    mapping(uint256 => mapping(address => bool)) private _objected;
+
+    mapping(uint256 => uint256) public qdayProposalOf;
+    // bytes32-keyed: private behind an explicit view, because hypc's QRVM
+    // auto-getter cleans the key as uint256 and a left-aligned bytes32 becomes
+    // zero (OC-V3-02).
+    mapping(bytes32 => uint256) private _courtProposalOf;
+
+    constructor(
+        address veArk_,
+        address timelock_,
+        address rules_,
+        address ark_,
+        address qday_,
+        uint16 proposalThresholdBps_,
+        uint16 qdayQuorumBps_,
+        uint16 objectionThresholdBps_,
+        uint256 admissionDeposit_
+    ) {
+        if (veArk_ == address(0) || timelock_ == address(0) || rules_ == address(0) || ark_ == address(0)) {
+            revert ZeroAddress();
+        }
+        // GV-17: each is a share of W or of principal.
+        if (proposalThresholdBps_ > BPS) revert BpsOutOfRange(proposalThresholdBps_);
+        if (qdayQuorumBps_ < QDAY_QUORUM_MIN_BPS || qdayQuorumBps_ > QDAY_QUORUM_MAX_BPS) {
+            revert BpsOutOfRange(qdayQuorumBps_);
+        }
+        if (objectionThresholdBps_ > BPS) revert BpsOutOfRange(objectionThresholdBps_);
+        veArk = IVeArk(veArk_);
+        timelock = IArkTimelock(timelock_);
+        rules = ArkGovernorRules(rules_);
+        ark = IERC20(ark_);
+        qday = IArkQDayOracle(qday_);
+        proposalThresholdBps = proposalThresholdBps_;
+        qdayQuorumBps = qdayQuorumBps_;
+        objectionThresholdBps = objectionThresholdBps_;
+        admissionDeposit = admissionDeposit_;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Round track                                                         */
+    /* ------------------------------------------------------------------ */
+
+    function propose(
+        IArkGovernor.ProposalKind kind,
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata payloads,
+        string calldata descriptionUri
+    ) external returns (uint256 id) {
+        uint8 k = uint8(kind);
+        ArkGovernorRules.Rule memory r = rules.ruleOf(k);
+        if (r.track != TRACK_ROUND) revert WrongTrack(k);
+        // OC-GOV-06: at S1 nothing proposed here can ever be queued, and every
+        // vote on it would pin its voters and hold delegated locks for nothing.
+        if (timelock.proposer() != address(this)) revert NotTimelockProposer();
+        (uint64 delay, bool vt) = _checkActions(k, targets, values, payloads);
+
+        id = ++proposalCount;
+        Proposal storage p = _proposals[id];
+        p.proposer = msg.sender;
+        p.kind = k;
+        p.status = S_LIVE;
+        p.track = r.track;
+        p.quorumBps = r.quorumBps;
+        p.approvalBps = r.approvalBps;
+        p.strict = r.strict;
+        p.delay = delay;
+        p.valueTransfer = vt;
+        p.round = uint64(r.audit ? ArkEpoch.epochOf(block.timestamp + AUDIT_PERIOD) + 1 : ArkEpoch.current() + 1);
+        _book(p.round, delay);
+
+        if (r.deposit) {
+            p.deposit = admissionDeposit;
+            if (!ark.transferFrom(msg.sender, address(this), admissionDeposit)) {
+                revert TransferFailed(address(this), admissionDeposit);
+            }
+        } else {
+            _checkThreshold();
+        }
+
+        if (k == K_STAKING_THREAT_STAGE) {
+            uint256 live = liveStageProposal;
+            if (live != 0 && _isLive(live)) revert StageProposalLive(live);
+            liveStageProposal = id;
+        }
+
+        for (uint256 i = 0; i < targets.length; i++) {
+            _targets[id].push(targets[i]);
+            _values[id].push(values[i]);
+            _payloads[id].push(payloads[i]);
+        }
+        emit ProposalCreated(id, kind, msg.sender, p.round, descriptionUri);
+    }
+
+    function openRound() external {
+        uint256 r = ArkEpoch.current();
+        if (_rounds[r].openedAt != 0) revert RoundAlreadyOpen(r);
+        _openRound(r);
+    }
+
+    function castVote(uint256 id, uint8 support) external {
+        if (support > 2) revert InvalidSupport(support);
+        Proposal storage p = _p(id);
+        IArkGovernor.ProposalState st = state(id);
+        if (st != IArkGovernor.ProposalState.Active) revert WrongState(id, st);
+
+        (, uint64 end) = _end(p);
+        bool late = p.track == TRACK_ROUND && !p.extended && block.timestamp + LATE_WINDOW >= end;
+        bool before = late && _passing(p);
+
+        _vote(id, p, support);
+        veArk.pinUntil(msg.sender, _horizon(p));
+
+        if (late && _passing(p) != before) {
+            p.extended = true;
+            emit VotingExtended(id, end + LATE_EXTENSION);
+        }
+    }
+
+    /**
+     * Permissionless. Two Succeeded proposals that name the same parameter key
+     * are mutually exclusive (OC-GOV-07, documented, not ordered): the first
+     * queued holds the key in the timelock (`KeyPending`) and its compare-and-
+     * swap `expected` moves the value, so the other cannot queue before its
+     * QUEUE_GRACE ends and expires. Which one wins is the order of `queue`,
+     * not the margin of the tally. Proposers who mean to compete on one key
+     * propose in different rounds; a margin ordering would need every
+     * Succeeded proposal of a round known before any queues, and a round's
+     * set is open until its vote closes.
+     */
+    function queue(uint256 id) external {
+        Proposal storage p = _p(id);
+        if (p.track != TRACK_ROUND) revert WrongTrack(p.kind);
+        IArkGovernor.ProposalState st = state(id);
+        if (st != IArkGovernor.ProposalState.Succeeded) revert WrongState(id, st);
+
+        uint256 n = _targets[id].length;
+        bytes32[] memory ids = new bytes32[](n);
+        for (uint256 i = 0; i < n; i++) {
+            (bytes32 op,) = timelock.scheduleWithValue(_targets[id][i], _values[id][i], _payloads[id][i]);
+            ids[i] = op;
+            _ops[id].push(op);
+        }
+        p.status = S_QUEUED;
+        p.queueEpoch = uint64(ArkEpoch.current());
+        emit ProposalQueued(id, ids, p.queueEpoch);
+    }
+
+    function cancel(uint256 id) external {
+        Proposal storage p = _p(id);
+        if (msg.sender != p.proposer) revert NotProposer(msg.sender);
+        IArkGovernor.ProposalState st = state(id);
+        if (st != IArkGovernor.ProposalState.Pending) revert WrongState(id, st);
+        p.status = S_CANCELLED;
+        emit ProposalCancelled(id);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Leg B objection chamber (D6)                                        */
+    /* ------------------------------------------------------------------ */
+
+    function object(uint256 id) external {
+        address src = objectionSource;
+        if (src == address(0)) revert Unset();
+        Proposal storage p = _p(id);
+        if (p.status != S_QUEUED || !p.valueTransfer || p.attempt != 0) revert NotObjectable(id);
+        IArkGovernor.ProposalState st = state(id);
+        if (st != IArkGovernor.ProposalState.Queued) revert WrongState(id, st);
+        if (_objected[id][msg.sender]) revert AlreadyObjected(id, msg.sender);
+
+        uint256 w = IObjectionSource(src).principalAt(msg.sender, p.queueEpoch);
+        if (w == 0) revert NoPrincipal(msg.sender);
+        _objected[id][msg.sender] = true;
+        p.objection += w;
+        emit Objected(id, msg.sender, w, p.objection);
+
+        uint256 total = IObjectionSource(src).totalPrincipalAt(p.queueEpoch);
+        if (p.objection * BPS >= uint256(objectionThresholdBps) * total) _contest(id, p);
+    }
+
+    /// Escalation, not veto: cancel the operations and re-vote once at 15% / 75%.
+    function _contest(uint256 id, Proposal storage p) private {
+        bytes32[] storage ops = _ops[id];
+        for (uint256 i = 0; i < ops.length; i++) {
+            if (timelock.stateOf(ops[i]) == IArkTimelock.OpState.Queued) timelock.cancel(ops[i]);
+        }
+        delete _ops[id];
+        p.status = S_LIVE;
+        p.attempt = 1;
+        p.round = uint64(ArkEpoch.current() + 1);
+        _book(p.round, p.delay);
+        p.quorumBps = CONTESTED_QUORUM_BPS;
+        p.approvalBps = CONTESTED_APPROVAL_BPS;
+        p.strict = false;
+        p.extended = false;
+        p.forVotes = 0;
+        p.againstVotes = 0;
+        p.abstainVotes = 0;
+        emit ProposalContested(id, p.round);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Off-round tracks                                                    */
+    /* ------------------------------------------------------------------ */
+
+    function proposeQDayRatification() external returns (uint256 id) {
+        if (address(qday) == address(0) || qday.state() != IArkQDayOracle.State.Certified) revert NotCertified();
+        uint256 r = qday.round();
+        if (qdayProposalOf[r] != 0) revert AlreadyOpen(bytes32(r), qdayProposalOf[r]);
+        id = _newOffRound(K_STAKING_QDAY, QDAY_PERIOD, bytes32(r));
+        qdayProposalOf[r] = id;
+    }
+
+    function proposeCourtEscalation(bytes32 caseId) external returns (uint256 id) {
+        if (court == address(0)) revert Unset();
+        uint256 lapses = IArkCourtEscalation(court).escalationLapsesAt(caseId);
+        if (lapses == 0) revert NotEscalated(caseId);
+        // A vote that ends after the court's lapse decides nothing: the case is
+        // finalized on its appeal verdict first (audit 2026-10-03, OC-COURT-03).
+        if (block.timestamp + COURT_PERIOD > lapses) revert EscalationLapsing(caseId, lapses);
+        if (_courtProposalOf[caseId] != 0) revert AlreadyOpen(caseId, _courtProposalOf[caseId]);
+        id = _newOffRound(K_STAKING_COURT, COURT_PERIOD, caseId);
+        _courtProposalOf[caseId] = id;
+    }
+
+    function resolve(uint256 id) external {
+        Proposal storage p = _p(id);
+        if (p.track == TRACK_ROUND) revert WrongTrack(p.kind);
+        if (p.status != S_LIVE) revert WrongState(id, state(id));
+        if (block.timestamp < p.voteEnd) revert VotingOpen(p.voteEnd);
+
+        bool passed = _passing(p);
+        p.status = S_RESOLVED;
+        p.passed = passed;
+        // For the court, `passed` means RETRIAL; failing to pass means UPHOLD.
+        if (p.kind == K_STAKING_QDAY) qday.resolve(uint256(p.subject), passed);
+        else IArkCourtEscalation(court).resolveEscalation(p.subject, passed);
+        emit ProposalResolved(id, passed);
+    }
+
+    function _newOffRound(uint8 k, uint64 period, bytes32 subject) private returns (uint256 id) {
+        ArkGovernorRules.Rule memory r = rules.ruleOf(k);
+        veArk.checkpoint();
+
+        id = ++proposalCount;
+        Proposal storage p = _proposals[id];
+        p.proposer = msg.sender;
+        p.kind = k;
+        p.status = S_LIVE;
+        p.track = r.track;
+        p.quorumBps = r.quorumBps;
+        p.approvalBps = r.approvalBps;
+        p.strict = r.strict;
+        p.snapshot = uint64(block.number);
+        p.voteEnd = uint64(block.timestamp) + period;
+        p.subject = subject;
+        veArk.holdDelegated(p.voteEnd, _horizon(p));
+        emit OffRoundProposalCreated(id, IArkGovernor.ProposalKind(k), subject, p.voteEnd);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Deposits and wiring                                                 */
+    /* ------------------------------------------------------------------ */
+
+    /// Returns a QIP deposit once the proposal is final and it was not forfeited.
+    function refundDeposit(uint256 id) external {
+        Proposal storage p = _p(id);
+        uint256 amount = p.deposit;
+        if (amount == 0) revert NoDeposit(id);
+        IArkGovernor.ProposalState st = state(id);
+        if (
+            st != IArkGovernor.ProposalState.Defeated && st != IArkGovernor.ProposalState.Executed
+                && st != IArkGovernor.ProposalState.Expired && st != IArkGovernor.ProposalState.Cancelled
+        ) revert DepositNotReleasable(id);
+        p.deposit = 0;
+        if (!ark.transfer(p.proposer, amount)) revert TransferFailed(p.proposer, amount);
+        emit DepositRefunded(id, p.proposer, amount);
+    }
+
+    /// Timelock only (48 h): the audit found misrepresentation (asset-governance.md §2 step 2).
+    function forfeitDeposit(uint256 id, address to) external {
+        if (msg.sender != address(timelock)) revert NotTimelock(msg.sender);
+        if (to == address(0)) revert ZeroAddress();
+        Proposal storage p = _p(id);
+        uint256 amount = p.deposit;
+        if (amount == 0) revert NoDeposit(id);
+        p.deposit = 0;
+        if (!ark.transfer(to, amount)) revert TransferFailed(to, amount);
+        emit DepositForfeited(id, to, amount);
+    }
+
+    function setCourt(address court_) external {
+        if (msg.sender != address(timelock)) revert NotTimelock(msg.sender);
+        if (court != address(0)) revert AlreadySet(court);
+        if (court_ == address(0)) revert ZeroAddress();
+        court = court_;
+        emit CourtSet(court_);
+    }
+
+    function setObjectionSource(address source) external {
+        if (msg.sender != address(timelock)) revert NotTimelock(msg.sender);
+        if (objectionSource != address(0)) revert AlreadySet(objectionSource);
+        if (source == address(0)) revert ZeroAddress();
+        objectionSource = source;
+        emit ObjectionSourceSet(source);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Views                                                               */
+    /* ------------------------------------------------------------------ */
+
+    function state(uint256 id) public view returns (IArkGovernor.ProposalState) {
+        Proposal storage p = _p(id);
+        if (p.status == S_CANCELLED) return IArkGovernor.ProposalState.Cancelled;
+        if (p.status == S_QUEUED) return _queuedState(id);
+        if (p.status == S_RESOLVED) {
+            return p.passed ? IArkGovernor.ProposalState.Executed : IArkGovernor.ProposalState.Defeated;
+        }
+        (bool opened, uint64 end) = _end(p);
+        if (!opened) {
+            if (ArkEpoch.current() > p.round) return IArkGovernor.ProposalState.Expired;
+            return p.attempt == 1 ? IArkGovernor.ProposalState.Contested : IArkGovernor.ProposalState.Pending;
+        }
+        if (block.timestamp < end) return IArkGovernor.ProposalState.Active;
+        if (!_passing(p)) return IArkGovernor.ProposalState.Defeated;
+        if (p.track == TRACK_ROUND && block.timestamp > uint256(end) + QUEUE_GRACE) {
+            return IArkGovernor.ProposalState.Expired;
+        }
+        return IArkGovernor.ProposalState.Succeeded;
+    }
+
+    function proposalOf(uint256 id)
+        external
+        view
+        returns (address proposer, uint8 kind, uint8 attempt, uint64 round, uint64 delay, bool valueTransfer, uint256 deposit)
+    {
+        Proposal storage p = _p(id);
+        return (p.proposer, p.kind, p.attempt, p.round, p.delay, p.valueTransfer, p.deposit);
+    }
+
+    function tallyOf(uint256 id)
+        external
+        view
+        returns (uint256 forVotes, uint256 againstVotes, uint256 abstainVotes, uint256 objection)
+    {
+        Proposal storage p = _p(id);
+        return (p.forVotes, p.againstVotes, p.abstainVotes, p.objection);
+    }
+
+    function actionsOf(uint256 id)
+        external
+        view
+        returns (address[] memory targets, uint256[] memory values, bytes[] memory payloads)
+    {
+        return (_targets[id], _values[id], _payloads[id]);
+    }
+
+    function opsOf(uint256 id) external view returns (bytes32[] memory) {
+        return _ops[id];
+    }
+
+    function roundOf(uint256 round) external view returns (Round memory) {
+        return _rounds[round];
+    }
+
+    /// 0 when `voter` has not voted in the proposal's current ballot, else support + 1.
+    function receiptOf(uint256 id, address voter) external view returns (uint8) {
+        return _receipt[_ballot(id, _p(id).attempt)][voter];
+    }
+
+    function voteEndOf(uint256 id) external view returns (uint64) {
+        (, uint64 end) = _end(_p(id));
+        return end;
+    }
+
+    function courtProposalOf(bytes32 caseId) external view returns (uint256) {
+        return _courtProposalOf[caseId];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Internals                                                           */
+    /* ------------------------------------------------------------------ */
+
+    function _p(uint256 id) private view returns (Proposal storage p) {
+        p = _proposals[id];
+        if (p.proposer == address(0)) revert UnknownProposal(id);
+    }
+
+    function _ballot(uint256 id, uint8 attempt) private pure returns (bytes32) {
+        return keccak256(abi.encode(id, attempt));
+    }
+
+    function _openRound(uint256 r) private {
+        veArk.checkpoint();
+        uint64 nowTs = uint64(block.timestamp);
+        _rounds[r] = Round(uint64(block.number), nowTs);
+        uint64 reach = _roundReach[r];
+        if (reach != 0) veArk.holdDelegated(nowTs + VOTING_PERIOD + LATE_EXTENSION, nowTs + reach);
+        emit RoundOpened(r, block.number);
+    }
+
+    function _book(uint64 round, uint64 delay) private {
+        uint64 reach = ROUND_REACH + delay;
+        if (reach > _roundReach[round]) _roundReach[round] = reach;
+    }
+
+    /**
+     * Live power against live total: a snapshot taken now is readable only from
+     * the next block. Locking just to propose costs a lock of at least 7 days.
+     */
+    function _checkThreshold() private view {
+        uint256 total = IVeArkLive(address(veArk)).totalWeight();
+        uint256 power = veArk.votingPowerOf(msg.sender);
+        if (power * BPS < uint256(proposalThresholdBps) * total) {
+            revert BelowProposalThreshold(power, (uint256(proposalThresholdBps) * total + BPS - 1) / BPS);
+        }
+    }
+
+    /**
+     * Every action must carry a selector its kind allows and the timelock knows.
+     * The delay is read back from the timelock only to compute the pin horizon.
+     * A value-transfer proposal is one action, so the chamber can never face a
+     * proposal that is half executed.
+     */
+    function _checkActions(uint8 k, address[] calldata targets, uint256[] calldata values, bytes[] calldata payloads)
+        private
+        view
+        returns (uint64 delay, bool vt)
+    {
+        uint256 n = targets.length;
+        if (n == 0 || n > MAX_ACTIONS || values.length != n || payloads.length != n) revert BadActions();
+        for (uint256 i = 0; i < n; i++) {
+            if (targets[i] == address(0) || payloads[i].length < 4) revert BadActions();
+            bytes4 s = bytes4(payloads[i][:4]);
+            if (!rules.allows(k, s)) revert SelectorNotAllowed(k, s);
+            // The delay and the value-transfer flag from the timelock's own
+            // table: one source, so the S2 chamber watches exactly what the S1
+            // chamber does (OC-GOV-01, GV-10).
+            (uint64 d, bool v) = timelock.ruleFor(payloads[i]);
+            if (d > delay) delay = d;
+            if (v) vt = true;
+        }
+        if (vt && n != 1) revert BadActions();
+    }
+
+    function _vote(uint256 id, Proposal storage p, uint8 support) private {
+        uint256 s = p.track == TRACK_ROUND ? _rounds[p.round].snapshot : p.snapshot;
+        bytes32 b = _ballot(id, p.attempt);
+        if (_receipt[b][msg.sender] != 0) revert AlreadyVoted(id, msg.sender);
+
+        address d = veArk.delegateeAt(msg.sender, s);
+        uint256 own;
+        if (d != msg.sender) {
+            own = veArk.weightAt(msg.sender, s);
+            if (own != 0) {
+                _overridden[b][d] += own;
+                uint8 c = _receipt[b][d];
+                if (c != 0) _tally(p, c - 1, own, false);
+            }
+        }
+        uint256 w = veArk.votingPowerAt(msg.sender, s) - _overridden[b][msg.sender] + own;
+        if (w == 0) revert NoWeight(msg.sender);
+
+        _receipt[b][msg.sender] = support + 1;
+        _tally(p, support, w, true);
+        emit VoteCast(id, msg.sender, support, w, own != 0 ? d : address(0));
+    }
+
+    function _tally(Proposal storage p, uint8 choice, uint256 w, bool add) private {
+        if (choice == 0) p.againstVotes = add ? p.againstVotes + w : p.againstVotes - w;
+        else if (choice == 1) p.forVotes = add ? p.forVotes + w : p.forVotes - w;
+        else p.abstainVotes = add ? p.abstainVotes + w : p.abstainVotes - w;
+    }
+
+    function _passing(Proposal storage p) private view returns (bool) {
+        uint256 total = veArk.totalWeightAt(p.track == TRACK_ROUND ? _rounds[p.round].snapshot : p.snapshot);
+        if (p.kind == K_STAKING_QDAY) {
+            return rules.qdayPasses(qdayQuorumBps, p.forVotes, p.againstVotes, total);
+        }
+        return rules.passes(p.quorumBps, p.approvalBps, p.strict, p.forVotes, p.againstVotes, p.abstainVotes, total);
+    }
+
+    function _end(Proposal storage p) private view returns (bool opened, uint64 end) {
+        if (p.track != TRACK_ROUND) return (true, p.voteEnd);
+        uint64 openedAt = _rounds[p.round].openedAt;
+        if (openedAt == 0) return (false, 0);
+        end = openedAt + VOTING_PERIOD;
+        if (p.extended) end += LATE_EXTENSION;
+        return (true, end);
+    }
+
+    /**
+     * Upper bound on when the decision takes effect (design §4.5): the latest
+     * vote end, the 14 days a Succeeded proposal may wait to be queued, its
+     * timelock delay, the 14 days an operation may wait to be executed, and
+     * one epoch. Without the two graces a winning voter withdrew at H and the
+     * decision took effect up to 28 days later (GV-02).
+     */
+    function _horizon(Proposal storage p) private view returns (uint64) {
+        if (p.track != TRACK_ROUND) return p.voteEnd + ArkEpoch.EPOCH_LENGTH;
+        return _rounds[p.round].openedAt + ROUND_REACH + p.delay;
+    }
+
+    function _queuedState(uint256 id) private view returns (IArkGovernor.ProposalState) {
+        bytes32[] storage ops = _ops[id];
+        bool all = true;
+        for (uint256 i = 0; i < ops.length; i++) {
+            IArkTimelock.OpState s = timelock.stateOf(ops[i]);
+            if (s == IArkTimelock.OpState.Cancelled) return IArkGovernor.ProposalState.Cancelled;
+            if (s == IArkTimelock.OpState.Expired) return IArkGovernor.ProposalState.Expired;
+            if (s != IArkTimelock.OpState.Executed) all = false;
+        }
+        return all ? IArkGovernor.ProposalState.Executed : IArkGovernor.ProposalState.Queued;
+    }
+
+    function _isLive(uint256 id) private view returns (bool) {
+        IArkGovernor.ProposalState st = state(id);
+        return st == IArkGovernor.ProposalState.Pending || st == IArkGovernor.ProposalState.Active
+            || st == IArkGovernor.ProposalState.Succeeded || st == IArkGovernor.ProposalState.Queued
+            || st == IArkGovernor.ProposalState.Contested;
+    }
+}

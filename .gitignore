@@ -1,0 +1,22 @@
+node_modules/
+build/
+abi/
+deployments/*.json
+tools/p*.hyp
+.env
+# Every other .env variant holds live secrets too; only the template is tracked
+# (audit 2026-09-29, R3-05).
+.env.*
+!.env.example
+.kurtosis/
+txt/
+build-qrvm/
+abi-qrvm/
+build-testnet/
+build-rapid/
+build-qrvm-testnet/
+build-qrvm-rapid/
+
+# Dev logs and agent memory stay local (removed from history 2026-10-02).
+/CLAUDE.md
+.claude/

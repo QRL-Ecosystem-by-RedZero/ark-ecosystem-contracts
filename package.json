@@ -1,0 +1,41 @@
+{
+  "name": "ark-ecosystem-contracts",
+  "version": "0.1.0",
+  "description": "Quantum Ark ecosystem layer in Hyperion for QRL: ARK, veARK, ArkGovernor, ArkTimelock, the Q-Day oracle, ArkPhase and the IArkFlow lanes",
+  "license": "MIT",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "vendor": "node scripts/vendor-oz.js",
+    "compile": "node scripts/compile.js",
+    "build": "npm run vendor && npm run compile",
+    "test": "node test/run.js",
+    "check": "npm run build && npm test",
+    "flatten:contract": "node scripts/flatten.js",
+    "flatten:contract:own": "node scripts/flatten.js --own",
+    "gen:deployer": "node scripts/gen-deployer.js",
+    "net:up": "bash scripts/kurtosis-up.sh",
+    "net:down": "bash scripts/kurtosis-down.sh",
+    "net:bootstrap": "bash scripts/wsl-bootstrap.sh",
+    "compile:qrvm": "node scripts/compile.js --qrvm",
+    "compile:testnet": "node scripts/compile.js --profile testnet",
+    "deploy:governance": "node scripts/deploy-governance.js",
+    "governance:keys": "node scripts/governance-keys.js"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "4.9.6",
+    "@theqrl/abi-v3": "npm:@theqrl/abi@^1.0.3",
+    "@theqrl/hypc": "^0.0.2",
+    "@theqrl/wallet.js": "^2.0.2",
+    "@theqrl/wallet.js-v6": "npm:@theqrl/wallet.js@^6.3.0",
+    "@theqrl/web3": "^0.5.0",
+    "@theqrl/web3-v3": "npm:@theqrl/web3@^1.0.3"
+  },
+  "devDependencies": {
+    "@ethereumjs/common": "^10.1.2",
+    "@ethereumjs/util": "^10.1.2",
+    "@ethereumjs/vm": "^10.1.2",
+    "ethereum-cryptography": "^3.2.0",
+    "ethers": "^6.17.0"
+  }
+}

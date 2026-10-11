@@ -1,0 +1,208 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * ArkMultisig — k-of-n approval, on chain, for the S1 proposer and the guardian
+ * of ArkTimelock (design §6.1, §7).
+ *
+ * APPROVALS ARE TRANSACTIONS, NOT SIGNATURES
+ * ------------------------------------------
+ * Hyperion has no `ecrecover`, so the usual "collect k signatures off chain and
+ * submit once" multisig cannot exist here. Each owner approves by sending a
+ * transaction, which Zond has already authenticated with ML-DSA-87. It costs k
+ * transactions per action and leaves no off-chain signature to phish or, after
+ * Q-Day, to forge.
+ *
+ * WHICH APPROVALS COUNT
+ * ---------------------
+ * Only those of CURRENT owners, counted at execution. An owner removed after
+ * approving no longer counts, so rotating out a compromised key also withdraws
+ * everything it approved and nothing is left half-authorised by it.
+ *
+ * The owner set and threshold change only through the multisig itself: a
+ * transaction to `address(this)` approved by k current owners.
+ *
+ * Keys must be separate from the attestation sealer and the relayer (design
+ * §6.1; audit H #2). That separation is a deployment rule the deploy script
+ * checks, not something this contract can see.
+ */
+contract ArkMultisig {
+    uint256 public constant MAX_OWNERS = 16;
+
+    struct Transaction {
+        address target;
+        bool executed;
+        uint256 value;
+        bytes data;
+    }
+
+    // An address-keyed mapping is private behind an explicit view: hypc's
+    // QRVM auto-getter cleans the key as uint256 before hashing, so a 64-byte
+    // address reads another slot (OC-V3-02).
+    address[] private _owners;
+    mapping(address => bool) private _isOwner;
+    uint256 public threshold;
+
+    Transaction[] private _txs;
+    mapping(uint256 => mapping(address => bool)) private _approved;
+
+    event Submitted(uint256 indexed id, address indexed owner, address indexed target, uint256 value, bytes data);
+    event Approved(uint256 indexed id, address indexed owner);
+    event Revoked(uint256 indexed id, address indexed owner);
+    event ExecutedTx(uint256 indexed id, address indexed by);
+    event OwnerAdded(address indexed owner);
+    event OwnerRemoved(address indexed owner);
+    event ThresholdChanged(uint256 threshold);
+    event Deposit(address indexed from, uint256 amount);
+
+    error NotOwner(address caller);
+    error OnlySelf(address caller);
+    error InvalidThreshold(uint256 threshold, uint256 owners);
+    error TooManyOwners(uint256 owners);
+    error DuplicateOwner(address owner);
+    error UnknownTx(uint256 id);
+    error AlreadyExecuted(uint256 id);
+    error AlreadyApproved(uint256 id, address owner);
+    error NotApproved(uint256 id, address owner);
+    error BelowThreshold(uint256 id, uint256 approvals, uint256 threshold);
+    error TxFailed(uint256 id, bytes returnData);
+
+    constructor(address[] memory owners_, uint256 threshold_) {
+        if (owners_.length > MAX_OWNERS) revert TooManyOwners(owners_.length);
+        for (uint256 i = 0; i < owners_.length; i++) _addOwner(owners_[i]);
+        _setThreshold(threshold_);
+    }
+
+    modifier onlyOwner() {
+        if (!_isOwner[msg.sender]) revert NotOwner(msg.sender);
+        _;
+    }
+
+    modifier onlySelf() {
+        if (msg.sender != address(this)) revert OnlySelf(msg.sender);
+        _;
+    }
+
+    /// Funds a payable action, such as the operator bond an `admitValidator` operation carries.
+    receive() external payable {
+        emit Deposit(msg.sender, msg.value);
+    }
+
+    /// Proposes a call and approves it as the submitting owner.
+    function submit(address target, uint256 value, bytes calldata data) external onlyOwner returns (uint256 id) {
+        if (target == address(0)) revert ZeroAddress();
+        id = _txs.length;
+        _txs.push();
+        Transaction storage t = _txs[id];
+        t.target = target;
+        t.value = value;
+        t.data = data;
+        emit Submitted(id, msg.sender, target, value, data);
+        _approve(id);
+    }
+
+    function approve(uint256 id) external onlyOwner {
+        _live(id);
+        _approve(id);
+    }
+
+    function revoke(uint256 id) external onlyOwner {
+        _live(id);
+        if (!_approved[id][msg.sender]) revert NotApproved(id, msg.sender);
+        _approved[id][msg.sender] = false;
+        emit Revoked(id, msg.sender);
+    }
+
+    /// Any owner, once k current owners have approved.
+    function execute(uint256 id) external onlyOwner returns (bytes memory result) {
+        Transaction storage t = _live(id);
+        uint256 n = approvalCount(id);
+        if (n < threshold) revert BelowThreshold(id, n, threshold);
+        t.executed = true;
+        bool ok;
+        (ok, result) = t.target.call{value: t.value}(t.data);
+        if (!ok) revert TxFailed(id, result);
+        emit ExecutedTx(id, msg.sender);
+    }
+
+    function addOwner(address owner) external onlySelf {
+        if (_owners.length >= MAX_OWNERS) revert TooManyOwners(_owners.length + 1);
+        _addOwner(owner);
+    }
+
+    function removeOwner(address owner) external onlySelf {
+        if (!_isOwner[owner]) revert NotOwner(owner);
+        _isOwner[owner] = false;
+        uint256 n = _owners.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (_owners[i] == owner) {
+                _owners[i] = _owners[n - 1];
+                _owners.pop();
+                break;
+            }
+        }
+        emit OwnerRemoved(owner);
+        if (threshold > _owners.length) _setThreshold(_owners.length);
+    }
+
+    function setThreshold(uint256 threshold_) external onlySelf {
+        _setThreshold(threshold_);
+    }
+
+    function owners() external view returns (address[] memory) {
+        return _owners;
+    }
+
+    function isOwner(address owner) external view returns (bool) {
+        return _isOwner[owner];
+    }
+
+    function approved(uint256 id, address owner) external view returns (bool) {
+        return _approved[id][owner];
+    }
+
+    function txCount() external view returns (uint256) {
+        return _txs.length;
+    }
+
+    function txOf(uint256 id) external view returns (address target, uint256 value, bytes memory data, bool executed) {
+        if (id >= _txs.length) revert UnknownTx(id);
+        Transaction storage t = _txs[id];
+        return (t.target, t.value, t.data, t.executed);
+    }
+
+    function approvalCount(uint256 id) public view returns (uint256 n) {
+        uint256 len = _owners.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (_approved[id][_owners[i]]) n++;
+        }
+    }
+
+    function _approve(uint256 id) private {
+        if (_approved[id][msg.sender]) revert AlreadyApproved(id, msg.sender);
+        _approved[id][msg.sender] = true;
+        emit Approved(id, msg.sender);
+    }
+
+    function _live(uint256 id) private view returns (Transaction storage t) {
+        if (id >= _txs.length) revert UnknownTx(id);
+        t = _txs[id];
+        if (t.executed) revert AlreadyExecuted(id);
+    }
+
+    function _addOwner(address owner) private {
+        if (owner == address(0)) revert ZeroAddress();
+        if (_isOwner[owner]) revert DuplicateOwner(owner);
+        _isOwner[owner] = true;
+        _owners.push(owner);
+        emit OwnerAdded(owner);
+    }
+
+    function _setThreshold(uint256 threshold_) private {
+        if (threshold_ == 0 || threshold_ > _owners.length) revert InvalidThreshold(threshold_, _owners.length);
+        threshold = threshold_;
+        emit ThresholdChanged(threshold_);
+    }
+}

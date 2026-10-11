@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./utils/ArkGovTables.hyp";
+
+/**
+ * ArkGovernorRules — the per-kind rules table of ArkGovernor, pure (design §5.5,
+ * §5.7). Split out so the governor's lifecycle code stays under the deployment
+ * ceiling; a table is also easier to audit on its own.
+ *
+ * Kinds are the ordinals of `IArkGovernor.ProposalKind`. Three things per kind:
+ *   - quorum and approval (non-strict "at least", or strict "more than");
+ *   - the track: a weekly round, the Q-Day ratification, or the court step;
+ *   - the selectors a proposal of that kind may carry. A kind with no selector
+ *     cannot be proposed at all: this is what stops a 10% / 66% "parameter"
+ *     proposal from carrying `renounceGuardian`, which needs 20% / 75%.
+ *
+ * The insurance kinds keep their governance.md §4 rules, but no insurance
+ * contract names the timelock yet, so none of them allows a selector today.
+ *
+ * Delays are NOT here: the timelock owns them (ArkGovTables). The governor
+ * never computes one.
+ */
+contract ArkGovernorRules {
+    uint8 public constant TRACK_NONE = 0;
+    uint8 public constant TRACK_ROUND = 1;
+    uint8 public constant TRACK_QDAY = 2;
+    uint8 public constant TRACK_COURT = 3;
+
+    uint8 internal constant K_PARAMETER = 0;
+    uint8 internal constant K_QIP_ASSET_LISTING = 1;
+    uint8 internal constant K_TREASURY_SPEND = 2;
+    uint8 internal constant K_ARK_RESERVE_AUCTION = 3;
+    uint8 internal constant K_QDAY_RATIFICATION = 4;
+    uint8 internal constant K_ATTESTER_SET_CHANGE = 5;
+    uint8 internal constant K_QURRL_SEASON = 6;
+    uint8 internal constant K_RENOUNCE_ADMIN = 7;
+    uint8 internal constant K_STAKING_PARAMETER = 8;
+    uint8 internal constant K_STAKING_THREAT_STAGE = 9;
+    uint8 internal constant K_STAKING_ADMISSION = 10;
+    uint8 internal constant K_STAKING_DELISTING = 11;
+    uint8 internal constant K_STAKING_VALIDATOR_BATCH = 12;
+    uint8 internal constant K_STAKING_QDAY = 13;
+    uint8 internal constant K_STAKING_COURT = 14;
+    // The ecosystem phase (ArkPhase, `QuantumArk-Phases.md` §3, 2026-10-07).
+    uint8 internal constant K_ECOSYSTEM_PHASE = 15;
+    uint8 internal constant K_ECOSYSTEM_RESTORATION = 16;
+
+    uint256 private constant BPS = 10000;
+
+    struct Rule {
+        uint16 quorumBps;
+        uint16 approvalBps;
+        bool strict;
+        uint8 track;
+        /// Proposed against the 5,000 ARK QIP deposit instead of the weight threshold.
+        bool deposit;
+        /// Voted in the first round after the 7-day audit of the QIP procedure.
+        bool audit;
+    }
+
+    function ruleOf(uint8 kind) public pure returns (Rule memory r) {
+        if (kind == K_PARAMETER) return Rule(500, 5000, true, TRACK_ROUND, false, false);
+        if (kind == K_QIP_ASSET_LISTING) return Rule(1000, 6600, false, TRACK_ROUND, true, true);
+        if (kind == K_TREASURY_SPEND) return Rule(1000, 6000, false, TRACK_ROUND, false, false);
+        if (kind == K_ARK_RESERVE_AUCTION) return Rule(1500, 6600, false, TRACK_ROUND, false, false);
+        // The insurance Q-Day kind has no oracle wired; the protocol's one oracle
+        // is ratified under StakingQDayRatification.
+        if (kind == K_QDAY_RATIFICATION) return Rule(1000, 5000, true, TRACK_NONE, false, false);
+        if (kind == K_ATTESTER_SET_CHANGE) return Rule(1000, 6600, false, TRACK_ROUND, false, false);
+        if (kind == K_QURRL_SEASON) return Rule(1000, 6600, false, TRACK_ROUND, false, false);
+        if (kind == K_RENOUNCE_ADMIN) return Rule(2000, 7500, false, TRACK_ROUND, false, false);
+        // Decision D4: Ark Staking uses the whitepaper's 10% / 66%.
+        if (kind == K_STAKING_PARAMETER || kind == K_STAKING_THREAT_STAGE || kind == K_STAKING_VALIDATOR_BATCH) {
+            return Rule(1000, 6600, false, TRACK_ROUND, false, false);
+        }
+        if (kind == K_STAKING_ADMISSION || kind == K_STAKING_DELISTING) {
+            return Rule(1000, 6600, false, TRACK_ROUND, true, true);
+        }
+        // No stored quorum or approval: `qdayPasses` with the governor's Q_min decides (design §6.6, OC-GOV-11).
+        if (kind == K_STAKING_QDAY) return Rule(0, 0, false, TRACK_QDAY, false, false);
+        if (kind == K_STAKING_COURT) return Rule(1000, 6600, false, TRACK_COURT, false, false);
+        // 0 <-> 1 <-> 2 and the defensive entry into Q-Day: as a threat-stage step.
+        if (kind == K_ECOSYSTEM_PHASE) return Rule(1000, 6600, false, TRACK_ROUND, false, false);
+        // 3 -> 4 is one-way and reopens every product: as the removal of an admin.
+        if (kind == K_ECOSYSTEM_RESTORATION) return Rule(2000, 7500, false, TRACK_ROUND, false, false);
+        return Rule(0, 0, false, TRACK_NONE, false, false);
+    }
+
+    function allows(uint8 kind, bytes4 s) external pure returns (bool) {
+        // The valuation oracle's keys ride `setParamsDiff`; its pause renewal is a parameter-kind vote.
+        if (kind == K_STAKING_PARAMETER) {
+            return s == ArkGovTables.SET_PARAMS_DIFF || s == ArkGovTables.ACCEPT_GOVERNANCE
+                || s == ArkGovTables.FORFEIT_DEPOSIT || s == ArkGovTables.PAUSE;
+        }
+        if (kind == K_STAKING_THREAT_STAGE) return s == ArkGovTables.SET_THREAT_STAGE;
+        // `enterQDay` opens no payout (ArkPhase): a phase vote, not a ratification.
+        if (kind == K_ECOSYSTEM_PHASE) return s == ArkGovTables.SET_PHASE || s == ArkGovTables.ENTER_QDAY;
+        if (kind == K_ECOSYSTEM_RESTORATION) return s == ArkGovTables.RESTORE;
+        if (kind == K_STAKING_ADMISSION) {
+            return s == ArkGovTables.ADMIT_ASSET || s == ArkGovTables.ADMIT_LIGHT_CLIENT
+                || s == ArkGovTables.ADMIT_SUCCESSOR;
+        }
+        // The seed return of a de-listed escrow is voted with the de-listing (re-audit 2026-09-30, ORIGIN-01).
+        if (kind == K_STAKING_DELISTING) return s == ArkGovTables.DELIST_ASSET || s == ArkGovTables.REQUEST_SEED_RETURN;
+        if (kind == K_STAKING_VALIDATOR_BATCH) {
+            return s == ArkGovTables.ADMIT_VALIDATOR || s == ArkGovTables.COMMIT_EXIT
+                || s == ArkGovTables.WITHDRAW_ADMISSION;
+        }
+        // A valuation reporter is replaced as a Q-Day attester is (technical reference §3.3).
+        if (kind == K_ATTESTER_SET_CHANGE) {
+            return s == ArkGovTables.ADD_ATTESTER || s == ArkGovTables.REMOVE_ATTESTER || s == ArkGovTables.ADD_REPORTER
+                || s == ArkGovTables.REMOVE_REPORTER;
+        }
+        if (kind == K_RENOUNCE_ADMIN) {
+            return s == ArkGovTables.RENOUNCE_GUARDIAN || s == ArkGovTables.HAND_OVER
+                || s == ArkGovTables.PROPOSE_GOVERNANCE || s == ArkGovTables.SET_COURT
+                || s == ArkGovTables.SET_OBJECTION_SOURCE;
+        }
+        return false;
+    }
+
+    /**
+     * Quorum on turnout (for + against + abstain) against W_global at the
+     * snapshot; approval on for / (for + against). Abstain counts toward quorum
+     * only. Cross-multiplied, so no rounding direction has to be chosen.
+     */
+    function passes(
+        uint16 quorumBps,
+        uint16 approvalBps,
+        bool strict,
+        uint256 forVotes,
+        uint256 againstVotes,
+        uint256 abstainVotes,
+        uint256 total
+    ) public pure returns (bool) {
+        uint256 turnout = forVotes + againstVotes + abstainVotes;
+        if (turnout == 0 || turnout * BPS < uint256(quorumBps) * total) return false;
+        uint256 lhs = forVotes * BPS;
+        uint256 rhs = uint256(approvalBps) * (forVotes + againstVotes);
+        return strict ? lhs > rhs : (forVotes > 0 && lhs >= rhs);
+    }
+
+    /**
+     * The Q-Day ratification rule of design §6.6 (decision of 2026-10-09,
+     * OC-GOV-11, replacing D3 as revised on 2026-09-28, G10):
+     *
+     *   ratified  iff  for >= Q_min  and  for > against
+     *   rejected  otherwise
+     *
+     * Q_min is `quorumBps` of W at the snapshot, counted on votes FOR alone.
+     * Abstentions do not enter. A ratification nobody votes for is rejected,
+     * and so is one with no veARK at all (for = 0 is never > against).
+     *
+     * The old rule (rejected only if against >= O_min and against >= for)
+     * declared Q-Day for good when nobody voted (OC-OPS-24). Q-Day is
+     * irreversible and starts payouts, so silence must not decide it.
+     *
+     * Monotone by construction: Q_min tests support, not turnout, so a vote for
+     * can only move the outcome toward ratification and a vote against only
+     * toward rejection. A turnout quorum was not monotone (GOV-11): a supporter
+     * could cross it by voting against.
+     *
+     * Trade-off: an apathetic or captured veARK can delay a payout by not
+     * ratifying; the attesters must then certify again in a new round. The
+     * protective freeze holds from the advisory until the rejection, so
+     * protection never waits on the vote.
+     */
+    function qdayPasses(uint16 quorumBps, uint256 forVotes, uint256 againstVotes, uint256 total)
+        external
+        pure
+        returns (bool)
+    {
+        return forVotes > againstVotes && forVotes * BPS >= uint256(quorumBps) * total;
+    }
+}

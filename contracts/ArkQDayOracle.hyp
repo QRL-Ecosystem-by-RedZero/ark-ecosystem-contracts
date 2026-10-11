@@ -1,0 +1,305 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkQDayOracle.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * ArkQDayOracle — the protocol's Q-Day declaration (design §6.6; staking
+ * whitepaper §6.2, yellow paper §4.1). Ark Staking reads `declared()`,
+ * `frozen()` and `declaredAt()` and never writes here.
+ *
+ * FAST TO PROTECT, SLOW TO PAY
+ * ----------------------------
+ *   1. ADVISORY   Any one bonded attester. The protective freeze starts at once;
+ *                 nothing is paid, so a single key is enough.
+ *   2. CERTIFY    5 of the 9 attesters, the raiser included, certify the same
+ *                 reproducible key-recovery artefact within 24 hours. Without
+ *                 that the advisory lapses and the freeze lifts.
+ *   3. RATIFY     ArkGovernor's 48-hour off-round vote (design §6.6): ratified
+ *                 only if the votes for reach Q_min of W and exceed the votes
+ *                 against; nobody voting is a rejection (OC-GOV-11).
+ *                 Ratified: `declared()` becomes true for good. Rejected: the
+ *                 freeze lifts and the raiser goes on cooldown; the attesters
+ *                 may certify again in a new round.
+ *
+ * veARK can only confirm or refuse a certification the attesters started and
+ * bonded; governance alone can never declare Q-Day (N4, G7).
+ *
+ * ATTESTERS
+ * ---------
+ * At most 9, each counting only while its native-QRL bond is at least
+ * `bondRequired`. The set changes only through ArkTimelock (7-day operations,
+ * kind AttesterSetChange), and never while an advisory or certification is
+ * open, so nobody can reshape the panel mid-count. A removed attester's bond is
+ * released 21 days later — long enough for the court to reach it — and the only
+ * slashing path is `slash`, callable by the court alone.
+ *
+ * GRIEFING BOUND
+ * --------------
+ * An advisory that lapses or is rejected puts its raiser on `advisoryCooldown`
+ * before it can raise again. Without it one attester could hold the freeze on
+ * indefinitely by re-raising every 24 hours. The cooldown is an uncalibrated
+ * reference value (7 days), fixed at construction.
+ *
+ * AFTER DECLARATION
+ * -----------------
+ * `frozen()` stays true: no principal matures and no release settles once the
+ * event is declared, which is the conservative reading for every Ark Staking
+ * path that checks it.
+ */
+contract ArkQDayOracle is IArkQDayOracle, ReentrancyGuard {
+    uint8 public constant PANEL_SIZE = 9;
+    uint8 public constant QUORUM = 5;
+    /// Scaled by the build profile: 10 min at testnet, 60 s (about five 12-s slots) at rapid, too
+    /// short for four certify transactions from four keys, so live Q-Day runs use testnet (OC-GOV-08).
+    uint64 public constant CERTIFICATION_WINDOW = 24 hours;
+    uint64 public constant BOND_RELEASE_DELAY = 21 days;
+
+    address public immutable timelock;
+    /// The court that may slash an attester's bond; zero disables slashing.
+    address public immutable court;
+    uint256 public immutable bondRequired;
+    uint64 public immutable advisoryCooldown;
+    address private immutable _deployer;
+
+    address public governor;
+
+    State private _state;
+    uint256 public round;
+    uint64 public advisoryAt;
+    uint64 public certifiedAt;
+    uint64 private _declaredAt;
+    bytes32 public artefactHash;
+    address public advisoryBy;
+    uint8 public certifications;
+
+    address[] private _attesters;
+    // Address-keyed mappings are private behind explicit views: hypc's QRVM
+    // auto-getter cleans the key as uint256 before hashing, so a 64-byte
+    // address reads another slot (OC-V3-02).
+    mapping(address => bool) private _isAttester;
+    mapping(address => uint256) private _bondOf;
+    mapping(address => uint64) private _bondReleaseAt;
+    mapping(address => uint64) private _cooldownUntil;
+    mapping(uint256 => mapping(address => bool)) private _certified;
+
+    /**
+     * @param timelock_ ArkTimelock: the only path that changes the attester set.
+     * @param court_ The court allowed to slash bonds, or zero.
+     * @param bondRequired_ Minimum native-QRL bond for an attester to count.
+     * @param advisoryCooldown_ Uncalibrated reference 7 days; see GRIEFING BOUND.
+     * @param attesters_ The initial panel, at most PANEL_SIZE.
+     */
+    constructor(
+        address timelock_,
+        address court_,
+        uint256 bondRequired_,
+        uint64 advisoryCooldown_,
+        address[] memory attesters_
+    ) {
+        if (timelock_ == address(0)) revert ZeroAddress();
+        if (attesters_.length > PANEL_SIZE) revert PanelFull(attesters_.length);
+        timelock = timelock_;
+        court = court_;
+        bondRequired = bondRequired_;
+        advisoryCooldown = advisoryCooldown_;
+        _deployer = msg.sender;
+        for (uint256 i = 0; i < attesters_.length; i++) _add(attesters_[i]);
+    }
+
+    /// Names ArkGovernor, the only caller of `resolve`. Deployer, once.
+    function setGovernor(address governor_) external {
+        if (msg.sender != _deployer) revert OnlyDeployer(msg.sender);
+        if (governor != address(0)) revert AlreadySet(governor);
+        if (governor_ == address(0)) revert ZeroAddress();
+        governor = governor_;
+        emit GovernorSet(governor_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The declaration                                                     */
+    /* ------------------------------------------------------------------ */
+
+    /// Step 1: one bonded attester freezes. The raiser's advisory is its own first certification.
+    function raiseAdvisory(bytes32 artefact) external {
+        _requireBonded(msg.sender);
+        if (_state != State.Normal) revert InvalidPhase(uint8(_state));
+        uint64 until = _cooldownUntil[msg.sender];
+        if (block.timestamp < until) revert OnCooldown(msg.sender, until);
+
+        uint256 r = ++round;
+        _state = State.Advisory;
+        advisoryAt = uint64(block.timestamp);
+        artefactHash = artefact;
+        advisoryBy = msg.sender;
+        certifications = 1;
+        _certified[r][msg.sender] = true;
+        emit AdvisoryRaised(r, msg.sender, artefact);
+        emit CertificationAdded(r, msg.sender, 1);
+    }
+
+    /// Step 2: another bonded attester certifies the same artefact inside the 24-hour window.
+    function certify() external {
+        _requireBonded(msg.sender);
+        if (_state != State.Advisory) revert InvalidPhase(uint8(_state));
+        uint64 closes = advisoryAt + CERTIFICATION_WINDOW;
+        if (block.timestamp > closes) revert WindowClosed(closes);
+        uint256 r = round;
+        if (_certified[r][msg.sender]) revert AlreadyCertified(msg.sender);
+
+        _certified[r][msg.sender] = true;
+        uint8 n = ++certifications;
+        emit CertificationAdded(r, msg.sender, n);
+        if (n >= QUORUM) {
+            _state = State.Certified;
+            certifiedAt = uint64(block.timestamp);
+            emit CertificationReached(r, certifiedAt);
+        }
+    }
+
+    /// Permissionless: an advisory without 5 certifications after 24 hours lifts the freeze.
+    function lapse() external {
+        if (_state != State.Advisory) revert InvalidPhase(uint8(_state));
+        uint64 closes = advisoryAt + CERTIFICATION_WINDOW;
+        if (block.timestamp <= closes) revert WindowOpen(closes);
+        _state = State.Normal;
+        _cooldownUntil[advisoryBy] = uint64(block.timestamp) + advisoryCooldown;
+        emit AdvisoryLapsed(round);
+    }
+
+    /// Step 3, from ArkGovernor only: ratify (irreversible) or reject (the freeze lifts).
+    function resolve(uint256 round_, bool ratified) external {
+        if (msg.sender != governor || governor == address(0)) revert OnlyGovernor(msg.sender);
+        if (_state != State.Certified) revert InvalidPhase(uint8(_state));
+        if (round_ != round) revert StaleRound(round_, round);
+        if (ratified) {
+            _state = State.Declared;
+            _declaredAt = uint64(block.timestamp);
+        } else {
+            _state = State.Normal;
+            _cooldownUntil[advisoryBy] = uint64(block.timestamp) + advisoryCooldown;
+        }
+        emit Resolved(round_, ratified);
+    }
+
+    function declared() external view returns (bool) {
+        return _state == State.Declared;
+    }
+
+    function frozen() external view returns (bool) {
+        return _state != State.Normal;
+    }
+
+    function declaredAt() external view returns (uint64) {
+        return _declaredAt;
+    }
+
+    function state() external view returns (State) {
+        return _state;
+    }
+
+    function hasCertified(uint256 round_, address attester) external view returns (bool) {
+        return _certified[round_][attester];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The panel                                                           */
+    /* ------------------------------------------------------------------ */
+
+    /// Timelock only (7-day operation), and never mid-process.
+    function addAttester(address attester) external {
+        _onlyTimelockAtRest();
+        if (_attesters.length >= PANEL_SIZE) revert PanelFull(_attesters.length);
+        _add(attester);
+    }
+
+    /// Timelock only (7-day operation), and never mid-process. The bond is released 21 days later.
+    function removeAttester(address attester) external {
+        _onlyTimelockAtRest();
+        if (!_isAttester[attester]) revert NotAttester(attester);
+        _isAttester[attester] = false;
+        uint256 n = _attesters.length;
+        for (uint256 i = 0; i < n; i++) {
+            if (_attesters[i] == attester) {
+                _attesters[i] = _attesters[n - 1];
+                _attesters.pop();
+                break;
+            }
+        }
+        _bondReleaseAt[attester] = uint64(block.timestamp) + BOND_RELEASE_DELAY;
+        emit AttesterRemoved(attester);
+    }
+
+    function postBond() external payable {
+        if (!_isAttester[msg.sender]) revert NotAttester(msg.sender);
+        if (msg.value == 0) revert ZeroValue();
+        _bondOf[msg.sender] += msg.value;
+        emit BondPosted(msg.sender, msg.value, _bondOf[msg.sender]);
+    }
+
+    /// A removed attester, once its release delay has passed.
+    function withdrawBond() external nonReentrant {
+        if (_isAttester[msg.sender]) revert BondLocked(type(uint64).max);
+        uint64 at = _bondReleaseAt[msg.sender];
+        if (block.timestamp < at) revert BondLocked(at);
+        uint256 amount = _bondOf[msg.sender];
+        if (amount == 0) revert NothingToWithdraw(msg.sender);
+        _bondOf[msg.sender] = 0;
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed(msg.sender, amount);
+        emit BondWithdrawn(msg.sender, amount);
+    }
+
+    /// The court only: moves up to the whole bond of an attester found to have attested falsely.
+    function slash(address attester, uint256 amount, address to) external nonReentrant {
+        if (court == address(0) || msg.sender != court) revert OnlyCourt(msg.sender);
+        if (to == address(0)) revert ZeroAddress();
+        uint256 bond = _bondOf[attester];
+        if (amount > bond) amount = bond;
+        _bondOf[attester] = bond - amount;
+        (bool ok,) = to.call{value: amount}("");
+        if (!ok) revert TransferFailed(to, amount);
+        emit AttesterSlashed(attester, amount, to);
+    }
+
+    function attesters() external view returns (address[] memory) {
+        return _attesters;
+    }
+
+    function isAttester(address a) external view returns (bool) {
+        return _isAttester[a];
+    }
+
+    function bondOf(address a) external view returns (uint256) {
+        return _bondOf[a];
+    }
+
+    function bondReleaseAt(address a) external view returns (uint64) {
+        return _bondReleaseAt[a];
+    }
+
+    function cooldownUntil(address a) external view returns (uint64) {
+        return _cooldownUntil[a];
+    }
+
+    function _add(address attester) private {
+        if (attester == address(0)) revert ZeroAddress();
+        if (_isAttester[attester]) revert AlreadyAttester(attester);
+        _isAttester[attester] = true;
+        _attesters.push(attester);
+        emit AttesterAdded(attester);
+    }
+
+    function _requireBonded(address a) private view {
+        if (!_isAttester[a]) revert NotAttester(a);
+        if (_bondOf[a] < bondRequired) revert BondTooLow(a, _bondOf[a], bondRequired);
+    }
+
+    function _onlyTimelockAtRest() private view {
+        if (msg.sender != timelock) revert OnlyTimelock(msg.sender);
+        if (_state == State.Advisory || _state == State.Certified) revert InvalidPhase(uint8(_state));
+    }
+}

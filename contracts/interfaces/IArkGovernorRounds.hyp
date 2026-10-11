@@ -1,0 +1,96 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IArkGovernor.hyp";
+
+/**
+ * ArkGovernor's external surface (design §5, §6.6 - §6.8).
+ *
+ * Ids are sequential uint256. Votes are 0 Against, 1 For, 2 Abstain. States are
+ * `IArkGovernor.ProposalState`, including the appended `Contested`.
+ */
+interface IArkGovernorRounds {
+    event RoundOpened(uint256 indexed round, uint256 snapshot);
+    event ProposalCreated(
+        uint256 indexed id, IArkGovernor.ProposalKind indexed kind, address indexed proposer, uint256 round, string descriptionUri
+    );
+    event OffRoundProposalCreated(
+        uint256 indexed id, IArkGovernor.ProposalKind indexed kind, bytes32 indexed subject, uint64 voteEnd
+    );
+    /// `overrode` is the delegatee whose power this vote took back (design §4.4), or zero.
+    event VoteCast(uint256 indexed id, address indexed voter, uint8 support, uint256 weight, address overrode);
+    event VotingExtended(uint256 indexed id, uint64 newVoteEnd);
+    event ProposalQueued(uint256 indexed id, bytes32[] opIds, uint256 queueEpoch);
+    event ProposalCancelled(uint256 indexed id);
+    event Objected(uint256 indexed id, address indexed holder, uint256 principal, uint256 totalObjection);
+    event ProposalContested(uint256 indexed id, uint256 revoteRound);
+    event ProposalResolved(uint256 indexed id, bool passed);
+    event DepositRefunded(uint256 indexed id, address indexed to, uint256 amount);
+    event DepositForfeited(uint256 indexed id, address indexed to, uint256 amount);
+    event CourtSet(address indexed court);
+    event ObjectionSourceSet(address indexed source);
+
+    error UnknownProposal(uint256 id);
+    error WrongState(uint256 id, IArkGovernor.ProposalState state);
+    error WrongTrack(uint8 kind);
+    error SelectorNotAllowed(uint8 kind, bytes4 selector);
+    error BadActions();
+    error BelowProposalThreshold(uint256 power, uint256 required);
+    error StageProposalLive(uint256 id);
+    error RoundAlreadyOpen(uint256 round);
+    error InvalidSupport(uint8 support);
+    error AlreadyVoted(uint256 id, address voter);
+    error NoWeight(address voter);
+    error NotProposer(address caller);
+    error NotTimelock(address caller);
+    error AlreadySet(address current);
+    error Unset();
+    error NotCertified();
+    error NotEscalated(bytes32 caseId);
+    error EscalationLapsing(bytes32 caseId, uint256 lapsesAt);
+    error AlreadyOpen(bytes32 subject, uint256 id);
+    error VotingOpen(uint64 voteEnd);
+    error NotObjectable(uint256 id);
+    error AlreadyObjected(uint256 id, address holder);
+    error NoPrincipal(address holder);
+    error NoDeposit(uint256 id);
+    error DepositNotReleasable(uint256 id);
+    /// A round proposal while the timelock's proposer is not this governor (S1): it could never be queued (OC-GOV-06).
+    error NotTimelockProposer();
+    /// A constructor share above 10,000 bps (GV-17).
+    error BpsOutOfRange(uint256 bps);
+
+    /// A weekly-round proposal. Voted in round r+1 (or the first round after the 7-day audit).
+    function propose(
+        IArkGovernor.ProposalKind kind,
+        address[] calldata targets,
+        uint256[] calldata values,
+        bytes[] calldata payloads,
+        string calldata descriptionUri
+    ) external returns (uint256 id);
+
+    /// Permissionless: snapshots the current epoch's round.
+    function openRound() external;
+
+    function castVote(uint256 id, uint8 support) external;
+
+    /// Permissionless: schedules a Succeeded proposal's actions in the timelock.
+    function queue(uint256 id) external;
+
+    /// Proposer only, before voting starts.
+    function cancel(uint256 id) external;
+
+    /// Leg B holder objects to a queued value-transfer proposal (D6).
+    function object(uint256 id) external;
+
+    /// Opens the 48-hour Q-Day ratification, only on a 5-of-9 certification.
+    function proposeQDayRatification() external returns (uint256 id);
+
+    /// Opens the 5-day court step, only on an escalation the court reports.
+    function proposeCourtEscalation(bytes32 caseId) external returns (uint256 id);
+
+    /// Permissionless, after an off-round vote ends: applies the result.
+    function resolve(uint256 id) external;
+
+    function state(uint256 id) external view returns (IArkGovernor.ProposalState);
+}

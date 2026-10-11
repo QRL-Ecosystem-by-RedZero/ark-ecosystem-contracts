@@ -1,0 +1,716 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC20/IERC20.hyp";
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IVeArk.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * veARK v2 — non-transferable, time-locked ARK with exact snapshots,
+ * overridable delegation and vote pins.
+ *
+ * Spec: ArkGovernance-Design.md §4 (umbrella repo). See IVeArk for why locking
+ * is mandatory and why this is the only vote source.
+ *
+ * WEIGHT CURVE
+ * ------------
+ * For a lock of `a` ARK ending at `e`, with L = MAX_LOCK:
+ *
+ *     w(t) = a + 3a(e - t) / L    while t < e     (4x at a full L, 1x at expiry)
+ *     w(t) = a                    once t >= e     (floor, until withdrawn)
+ *
+ * An expired lock keeps 1x: it is still ARK the holder chose not to sell, and
+ * stripping it of all say would push people onto a withdraw-and-relock
+ * treadmill that produces nothing.
+ *
+ * WHY TOTALS ARE EXACT
+ * --------------------
+ * Summed over any set of locks, the curve is affine in t:
+ *
+ *     W(t) = A + 3(B - C·t) / L
+ *     A = Σ a over unwithdrawn locks,  B = Σ a·e and C = Σ a over locks with e > t
+ *
+ * B and C change with the clock only when a lock expires. Lock ends are rounded
+ * down to an epoch boundary, so they change only at boundaries, and the change
+ * due at each boundary is booked in advance in `_expiring`. Walking the
+ * boundaries between two points reproduces the totals exactly, with no
+ * per-account loop. Two kinds of set are kept: GLOBAL (every lock, the quorum
+ * denominator) and one per delegatee (the locks it votes with).
+ *
+ * Every write brings the sets it touches up to `now` before changing them, so
+ * `_expiring[e]` is only ever modified for e > now. Past history is therefore
+ * never rewritten, which is what makes a read at an old snapshot correct
+ * without having been written at the time.
+ *
+ * Each set is floored once and each lock is floored once, so
+ * W_global >= Σ power(d) >= Σ w(lock). The slack is below one wei per lock and
+ * sits on the side that makes quorum harder (G4).
+ *
+ * SNAPSHOTS NEED A RECORDED TIMESTAMP
+ * -----------------------------------
+ * Weight depends on time, and a contract cannot read the timestamp of a past
+ * block. Every write to GLOBAL, and every `checkpoint()`, stores the block's
+ * timestamp beside its number, and `...At(blk)` reverts for any block without
+ * one. The governor opens each round with `checkpoint()` and snapshots that
+ * block; everything written later in the same block belongs to the snapshot,
+ * which is harmless because locking before a snapshot is allowed anyway.
+ *
+ * DELEGATION AND OVERRIDE
+ * -----------------------
+ * Each lock has exactly one delegatee, itself by default, one level deep. This
+ * contract answers three questions at a snapshot: the lock's own weight, its
+ * delegatee, and the delegatee's total power. The override itself — a delegator
+ * voting in person takes its weight back out of the delegatee's power for that
+ * proposal — is bookkeeping per proposal and lives in the governor (§4.4).
+ *
+ * VOTE PIN
+ * --------
+ * MIN_LOCK is shorter than any timelock, and an expired lock still votes at 1x,
+ * so without a pin a holder could vote and sell before the decision lands. The
+ * governor raises `_pin[voter]` to the latest time the proposal could take
+ * effect. A lock may not be withdrawn before the higher of its own pin and its
+ * delegatee's, and switching delegatee carries the old delegatee's pin along
+ * (G6). A pin never changes weight, only when ARK may leave.
+ *
+ * A delegated lock also answers for the vote its delegatee has NOT cast yet:
+ * the delegatee counts power(d, s) at the snapshot, whenever it votes, so a
+ * delegator that left after s would otherwise walk out with weight still to be
+ * used. While a vote window is open (`holdDelegated`, sent by the
+ * governor when a round or off-round track opens) every lock delegated to
+ * someone else is held until the window's latest effect horizon, and leaving
+ * that delegatee — `delegate` elsewhere — keeps the hold as the lock's own pin.
+ * One window record serves all open tracks: overlapping windows merge into the
+ * later end and the later horizon, and the record is replaced once all have
+ * closed. That over-holds a lock delegated after the snapshot, the same
+ * trade-off §4.5 already accepts for a delegatee's cast vote.
+ *
+ * THE DIVIDEND IS PAID IN QRL, ON UNITS
+ * -------------------------------------
+ * `distributeDividend` receives the 5% premium slice the tokenomics assigns to
+ * lockers, in native QRL. It is measured in UNITS — an account's live weight as
+ * of its last sync — because a dividend index needs a denominator that only
+ * moves when a transaction writes it. `syncWeight` is permissionless: syncing a
+ * stale account down raises everyone else's share, so the people motivated to
+ * call it are the ones it pays. Units follow the lock owner, never the
+ * delegatee, and no vote ever reads them.
+ */
+contract VeArk is IVeArk, ReentrancyGuard {
+    /// Shortest permitted lock, measured after rounding the end down.
+    uint64 public constant MIN_LOCK = 7 days;
+
+    /// Longest permitted lock, and the duration that earns the maximum boost.
+    uint64 public constant MAX_LOCK = 4 * 365 days;
+
+    /// One voting round. Same clock as ArkEpoch in ark-staking: unix-aligned, 7 days.
+    uint64 public constant EPOCH_LENGTH = 7 days;
+
+    /// Weight multiplier at maximum lock, in bps.
+    uint16 public constant MAX_BOOST_BPS = 40000;
+
+    /// Weight multiplier at expiry, in bps.
+    uint16 public constant MIN_BOOST_BPS = 10000;
+
+    uint16 private constant BPS = 10000;
+
+    /// Fixed-point precision for the dividend index.
+    uint256 public constant ACC = 1e18;
+
+    /// Key of the set holding every lock. No lock can be delegated to address(0).
+    address private constant GLOBAL = address(0);
+
+    /// Totals of one set of locks as of `ts`: A, C and B in the header's notation.
+    struct Point {
+        uint128 locked;
+        uint128 active;
+        uint128 activeEnds;
+        uint64 blk;
+        uint64 ts;
+    }
+
+    /// What leaves a set's C and B at one epoch boundary.
+    struct Expiry {
+        uint128 amount;
+        uint128 ends;
+    }
+
+    /// A lock as it stood from block `blk` onwards.
+    struct LockCheckpoint {
+        uint128 amount;
+        uint64 end;
+        uint64 blk;
+        address delegatee;
+    }
+
+    IERC20 public immutable ark;
+
+    /// The only address that may fix the governor, and only once.
+    address private immutable _deployer;
+
+    /// The only address that may pin voters.
+    address public governor;
+
+    mapping(address => Lock) private _locks;
+    mapping(address => address) private _delegatee;
+    mapping(address => LockCheckpoint[]) private _history;
+
+    /// Point history per set: GLOBAL, or a delegatee.
+    mapping(address => Point[]) private _points;
+
+    /// set => epoch boundary => what expires there.
+    mapping(address => mapping(uint256 => Expiry)) private _expiring;
+
+    mapping(address => uint64) private _pin;
+
+    /// Open vote window: until `_holdEnd`, delegated locks are held until `_holdUntil`.
+    uint64 private _holdEnd;
+    uint64 private _holdUntil;
+
+    /// Treasury, backstop, incentives, timelock: fixed at deployment, no setter (G11).
+    mapping(address => bool) private _protocolOwned;
+
+    /// Weight as of each account's last sync. `_totalUnits` is their sum.
+    mapping(address => uint256) private _units;
+    uint256 private _totalUnits;
+
+    /// Cumulative QRL paid per unit of weight, scaled by ACC.
+    uint256 private _accQrlPerUnit;
+    mapping(address => uint256) private _rewardDebt;
+    mapping(address => uint256) private _credited;
+
+    /// Remainder of the last index division, carried into the next distribution.
+    uint256 private _dust;
+
+    /// An amount does not fit the packed totals. Unreachable with ARK's fixed supply.
+    error AmountTooLarge(uint256 amount);
+
+    /**
+     * @param ark_ The ARK token.
+     * @param protocolOwned Addresses that hold ARK on behalf of the protocol.
+     *        They can never lock or be delegated to, so a captured governor
+     *        cannot lock the treasury to raise its own quorum (G11).
+     */
+    constructor(address ark_, address[] memory protocolOwned) {
+        if (ark_ == address(0)) revert ZeroAddress();
+        ark = IERC20(ark_);
+        _deployer = msg.sender;
+        for (uint256 i = 0; i < protocolOwned.length; i++) {
+            if (protocolOwned[i] == address(0)) revert ZeroAddress();
+            _protocolOwned[protocolOwned[i]] = true;
+        }
+    }
+
+    /**
+     * Fixes the governor. One shot, deployer only.
+     *
+     * @dev The governor is deployed after this contract, since it reads it. The
+     *      only power it gets here is `pinUntil` and `holdDelegated`, which can
+     *      delay a withdrawal but never move ARK or weight.
+     */
+    function setGovernor(address governor_) external {
+        if (msg.sender != _deployer) revert NotDeployer(msg.sender);
+        if (governor != address(0)) revert GovernorAlreadySet(governor);
+        if (governor_ == address(0)) revert ZeroAddress();
+        governor = governor_;
+        emit GovernorSet(governor_);
+    }
+
+    // ------------------------------------------------------------------ locks
+
+    function createLock(uint256 amount, uint64 unlockTime) external nonReentrant {
+        if (amount == 0) revert ZeroValue();
+        if (_protocolOwned[msg.sender]) revert ProtocolOwned(msg.sender);
+        if (_locks[msg.sender].amount != 0) revert LockAlreadyExists(msg.sender);
+
+        uint64 nowTs = uint64(block.timestamp);
+        uint64 end = _roundDown(unlockTime);
+        _checkDuration(nowTs, end);
+
+        _locks[msg.sender] = Lock({amount: amount, start: nowTs, end: end});
+        _delegatee[msg.sender] = msg.sender;
+        _enter(GLOBAL, amount, end);
+        _enter(msg.sender, amount, end);
+        _record(msg.sender);
+        _resync(msg.sender);
+
+        if (!ark.transferFrom(msg.sender, address(this), amount)) {
+            revert TransferFailed(address(this), amount);
+        }
+
+        emit LockCreated(msg.sender, amount, end);
+    }
+
+    function increaseAmount(uint256 amount) external nonReentrant {
+        if (amount == 0) revert ZeroValue();
+
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+
+        uint64 nowTs = uint64(block.timestamp);
+        if (lock.end <= nowTs) revert LockNotExpired(lock.end, nowTs);
+
+        _settle(msg.sender);
+        lock.amount += amount;
+        _enter(GLOBAL, amount, lock.end);
+        _enter(_delegatee[msg.sender], amount, lock.end);
+        _record(msg.sender);
+        _resync(msg.sender);
+
+        if (!ark.transferFrom(msg.sender, address(this), amount)) {
+            revert TransferFailed(address(this), amount);
+        }
+
+        emit LockIncreased(msg.sender, amount, lock.amount);
+    }
+
+    /**
+     * Extends a lock. Shortening is impossible: there is no branch for it.
+     *
+     * @dev Being able to shorten would let a holder vote at 4x and then cut the
+     *      lock to a week the moment the vote lands. An expired lock may be
+     *      re-armed this way; it then counts from the new end like any other.
+     */
+    function extendLock(uint64 newUnlockTime) external {
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+
+        uint64 end = _roundDown(newUnlockTime);
+        if (end <= lock.end) revert LockCannotShorten(lock.end, end);
+        _checkDuration(uint64(block.timestamp), end);
+
+        _settle(msg.sender);
+        uint64 previous = lock.end;
+        uint256 amount = lock.amount;
+        address d = _delegatee[msg.sender];
+
+        _leave(GLOBAL, amount, previous);
+        _enter(GLOBAL, amount, end);
+        _leave(d, amount, previous);
+        _enter(d, amount, end);
+        lock.end = end;
+        _record(msg.sender);
+        _resync(msg.sender);
+
+        emit LockExtended(msg.sender, previous, end);
+    }
+
+    /**
+     * Withdraws a matured lock in full.
+     *
+     * @dev There is no partial or early exit. A penalised early exit would put a
+     *      price on abandoning the long horizon, and anyone bribing a vote would
+     *      simply pay it. Maturity alone is not enough: a vote cast with this
+     *      weight, by the owner or its delegatee, holds it until `pinOf`.
+     */
+    function withdraw() external nonReentrant {
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+
+        uint64 nowTs = uint64(block.timestamp);
+        if (nowTs < lock.end) revert LockNotExpired(lock.end, nowTs);
+        uint64 pinned = pinOf(msg.sender);
+        if (nowTs < pinned) revert VotePinned(msg.sender, pinned, nowTs);
+
+        uint256 amount = lock.amount;
+        uint64 end = lock.end;
+        address d = _delegatee[msg.sender];
+
+        _settle(msg.sender);
+        _leave(GLOBAL, amount, end);
+        _leave(d, amount, end);
+        delete _locks[msg.sender];
+        delete _delegatee[msg.sender];
+        _record(msg.sender);
+        _resync(msg.sender);
+
+        if (!ark.transfer(msg.sender, amount)) revert TransferFailed(msg.sender, amount);
+
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    // ------------------------------------------------------------- delegation
+
+    function delegate(address to) external {
+        Lock storage lock = _locks[msg.sender];
+        if (lock.amount == 0) revert NoLock(msg.sender);
+        if (to == address(0)) revert ZeroAddress();
+        if (_protocolOwned[to]) revert ProtocolOwned(to);
+
+        address from = _delegatee[msg.sender];
+        if (to == from) revert AlreadyDelegated(to);
+
+        // The old delegatee may have voted with this weight, or may still vote
+        // with it in an open window. Leaving it must not be a way to walk out
+        // before that vote takes effect.
+        if (from != msg.sender) {
+            uint64 inherited = _lentPin(from);
+            if (inherited > _pin[msg.sender]) {
+                _pin[msg.sender] = inherited;
+                emit PinRaised(msg.sender, inherited);
+            }
+        }
+
+        _leave(from, lock.amount, lock.end);
+        _enter(to, lock.amount, lock.end);
+        _delegatee[msg.sender] = to;
+        _record(msg.sender);
+
+        emit DelegateChanged(msg.sender, from, to);
+    }
+
+    function pinUntil(address voter, uint64 until) external {
+        if (msg.sender != governor) revert NotGovernor(msg.sender);
+        if (until > _pin[voter]) {
+            _pin[voter] = until;
+            emit PinRaised(voter, until);
+        }
+    }
+
+    function holdDelegated(uint64 voteEnd, uint64 until) external {
+        if (msg.sender != governor) revert NotGovernor(msg.sender);
+        if (block.timestamp >= _holdEnd) {
+            _holdEnd = voteEnd;
+            _holdUntil = until;
+        } else {
+            if (voteEnd > _holdEnd) _holdEnd = voteEnd;
+            if (until > _holdUntil) _holdUntil = until;
+        }
+        emit DelegatedHold(_holdEnd, _holdUntil);
+    }
+
+    function checkpoint() external {
+        _store(GLOBAL, _latest(GLOBAL));
+    }
+
+    // ------------------------------------------------------------- live reads
+
+    function lockOf(address account) external view returns (Lock memory) {
+        return _locks[account];
+    }
+
+    function delegateeOf(address account) external view returns (address) {
+        return _delegatee[account];
+    }
+
+    function pinOf(address account) public view returns (uint64) {
+        uint64 own = _pin[account];
+        address d = _delegatee[account];
+        if (d == account || d == address(0)) return own;
+        uint64 lent = _lentPin(d);
+        return own > lent ? own : lent;
+    }
+
+    function delegatedHold() external view returns (uint64 voteEnd, uint64 until) {
+        return (_holdEnd, _holdUntil);
+    }
+
+    function isProtocolOwned(address account) external view returns (bool) {
+        return _protocolOwned[account];
+    }
+
+    function weightOf(address account) public view returns (uint256) {
+        Lock storage lock = _locks[account];
+        return _lockWeight(lock.amount, lock.end, uint64(block.timestamp));
+    }
+
+    function votingPowerOf(address delegatee) external view returns (uint256) {
+        return _setWeight(_latest(delegatee));
+    }
+
+    /// @return Exact total weight right now.
+    function totalWeight() external view returns (uint256) {
+        return _setWeight(_latest(GLOBAL));
+    }
+
+    /**
+     * Jury draw weight contributed by veARK: the account's OWN lock.
+     *
+     * @dev Equal to `weightOf`, but read separately on purpose: this is only
+     *      ONE FACTOR of the draw. IStakingVault caps it by tier-scoped stake,
+     *      so a large veARK position with nothing staked in a tier still cannot
+     *      judge that tier. Delegated-in weight never counts: a juror is bonded
+     *      by what it locked, not by what others lent it for voting.
+     */
+    function juryWeightOf(address account) external view returns (uint256) {
+        return weightOf(account);
+    }
+
+    /// @notice Current boost multiplier for an account, in bps. 10000 = 1x.
+    function boostBpsOf(address account) external view returns (uint16) {
+        Lock storage lock = _locks[account];
+        if (lock.amount == 0) return 0;
+        return uint16((weightOf(account) * BPS) / lock.amount);
+    }
+
+    // --------------------------------------------------------- snapshot reads
+
+    function weightAt(address account, uint256 blockNumber) external view returns (uint256) {
+        uint64 t = _snapshot(blockNumber).ts;
+        LockCheckpoint memory c = _lockAt(account, blockNumber);
+        return _lockWeight(c.amount, c.end, t);
+    }
+
+    function delegateeAt(address account, uint256 blockNumber) external view returns (address) {
+        _snapshot(blockNumber);
+        return _lockAt(account, blockNumber).delegatee;
+    }
+
+    function votingPowerAt(address delegatee, uint256 blockNumber) external view returns (uint256) {
+        uint64 t = _snapshot(blockNumber).ts;
+        Point[] storage pts = _points[delegatee];
+        uint256 n = _pointsUpTo(pts, blockNumber);
+        if (n == 0) return 0;
+        Point memory p = _advance(delegatee, pts[n - 1], t);
+        p.ts = t;
+        return _setWeight(p);
+    }
+
+    function totalWeightAt(uint256 blockNumber) external view returns (uint256) {
+        return _setWeight(_snapshot(blockNumber));
+    }
+
+    // --------------------------------------------------------------- dividend
+
+    /**
+     * Pays the veARK dividend slice into the contract.
+     *
+     * @dev Callable by anyone; in production it is ICapitalPool, and only after
+     *      the solvency-first rule has decided this slice is payable at all.
+     *      Reverts when nobody holds a lock: silently swallowing the value would
+     *      strand it here with no owner and no way out.
+     */
+    function distributeDividend() external payable {
+        if (msg.value == 0) revert ZeroValue();
+        if (_totalUnits == 0) revert NoLockedWeight();
+
+        // Integer division always leaves a remainder. Carrying it into the next
+        // round is what makes "nothing is stranded" true rather than merely
+        // nearly true.
+        uint256 amount = msg.value + _dust;
+        uint256 delta = (amount * ACC) / _totalUnits;
+        _accQrlPerUnit += delta;
+        _dust = amount - (delta * _totalUnits) / ACC;
+
+        emit DividendDistributed(amount - _dust, _accQrlPerUnit, _totalUnits);
+    }
+
+    /// @return Remainder held back from the last division, paid out in a later round.
+    function carriedDust() external view returns (uint256) {
+        return _dust;
+    }
+
+    /// @notice Pays out everything accrued to the caller.
+    function claimDividend() external nonReentrant returns (uint256 amount) {
+        _settle(msg.sender);
+
+        amount = _credited[msg.sender];
+        if (amount == 0) revert NothingToClaim(msg.sender);
+        _credited[msg.sender] = 0;
+
+        (bool ok,) = msg.sender.call{value: amount}("");
+        if (!ok) revert TransferFailed(msg.sender, amount);
+
+        emit DividendClaimed(msg.sender, amount);
+    }
+
+    function pendingDividend(address account) external view returns (uint256) {
+        uint256 accrued = (_units[account] * _accQrlPerUnit) / ACC;
+        uint256 debt = _rewardDebt[account];
+        return _credited[account] + (accrued > debt ? accrued - debt : 0);
+    }
+
+    /**
+     * Brings an account's weight units in line with its decayed live weight.
+     *
+     * @dev Settling first means the stale account keeps what it genuinely
+     *      accrued up to this moment; only its future share is corrected.
+     */
+    function syncWeight(address account) public {
+        uint256 previous = _units[account];
+        _settle(account);
+        _resync(account);
+        if (previous != _units[account]) emit WeightSynced(account, previous, _units[account]);
+    }
+
+    function unitsOf(address account) external view returns (uint256) {
+        return _units[account];
+    }
+
+    /// @return Sum of every account's units, the dividend denominator. Not a vote total.
+    function totalUnits() external view returns (uint256) {
+        return _totalUnits;
+    }
+
+    /// What a lock delegated to `d` answers for: d's pin, and the open window's hold.
+    function _lentPin(address d) private view returns (uint64 lent) {
+        lent = _pin[d];
+        if (block.timestamp < _holdEnd && _holdUntil > lent) lent = _holdUntil;
+    }
+
+    // ----------------------------------------------------------- set algebra
+
+    /// Adds a lock's contribution to a set, booking its expiry at `end`.
+    function _enter(address set, uint256 amount, uint64 end) private {
+        Point memory p = _latest(set);
+        uint128 a = _u128(amount);
+        p.locked += a;
+        if (end > p.ts) {
+            uint128 ends = _u128(amount * end);
+            p.active += a;
+            p.activeEnds += ends;
+            Expiry storage x = _expiring[set][end];
+            x.amount += a;
+            x.ends += ends;
+        }
+        _store(set, p);
+    }
+
+    /// Removes a lock's contribution. An expired lock has already left C and B.
+    function _leave(address set, uint256 amount, uint64 end) private {
+        Point memory p = _latest(set);
+        uint128 a = _u128(amount);
+        p.locked -= a;
+        if (end > p.ts) {
+            uint128 ends = _u128(amount * end);
+            p.active -= a;
+            p.activeEnds -= ends;
+            Expiry storage x = _expiring[set][end];
+            x.amount -= a;
+            x.ends -= ends;
+        }
+        _store(set, p);
+    }
+
+    /// The set's last point, brought forward to this block.
+    function _latest(address set) private view returns (Point memory p) {
+        Point[] storage pts = _points[set];
+        uint256 len = pts.length;
+        if (len != 0) p = pts[len - 1];
+        uint64 nowTs = uint64(block.timestamp);
+        p = _advance(set, p, nowTs);
+        p.blk = uint64(block.number);
+        p.ts = nowTs;
+    }
+
+    /**
+     * Applies every expiry booked at a boundary in (p.ts, t]. Leaves `ts` alone.
+     *
+     * @dev Stops as soon as nothing is active: nothing further can be booked.
+     *      Every active end is at most MAX_LOCK past p.ts, so the loop is
+     *      bounded by MAX_LOCK / EPOCH_LENGTH + 1 = 209 iterations.
+     */
+    function _advance(address set, Point memory p, uint64 t) private view returns (Point memory) {
+        if (p.active == 0) return p;
+        uint256 b = (uint256(p.ts) / EPOCH_LENGTH + 1) * EPOCH_LENGTH;
+        while (b <= t) {
+            Expiry storage x = _expiring[set][b];
+            p.active -= x.amount;
+            p.activeEnds -= x.ends;
+            if (p.active == 0) break;
+            b += EPOCH_LENGTH;
+        }
+        return p;
+    }
+
+    /// Appends a point, collapsing repeated writes in one block.
+    function _store(address set, Point memory p) private {
+        Point[] storage pts = _points[set];
+        uint256 len = pts.length;
+        if (len != 0 && pts[len - 1].blk == p.blk) pts[len - 1] = p;
+        else pts.push(p);
+    }
+
+    /// W = A + 3(B - C·t) / L at the point's own time. Every active end is > ts.
+    function _setWeight(Point memory p) private pure returns (uint256) {
+        uint256 remaining = uint256(p.activeEnds) - uint256(p.active) * p.ts;
+        return p.locked + (3 * remaining) / MAX_LOCK;
+    }
+
+    function _lockWeight(uint256 amount, uint64 end, uint64 t) private pure returns (uint256) {
+        if (end <= t) return amount;
+        return amount + (3 * amount * (end - t)) / MAX_LOCK;
+    }
+
+    // -------------------------------------------------------------- history
+
+    function _record(address account) private {
+        LockCheckpoint memory c = LockCheckpoint({
+            amount: _u128(_locks[account].amount),
+            end: _locks[account].end,
+            blk: uint64(block.number),
+            delegatee: _delegatee[account]
+        });
+        LockCheckpoint[] storage h = _history[account];
+        uint256 len = h.length;
+        if (len != 0 && h[len - 1].blk == c.blk) h[len - 1] = c;
+        else h.push(c);
+    }
+
+    function _lockAt(address account, uint256 blockNumber) private view returns (LockCheckpoint memory c) {
+        LockCheckpoint[] storage h = _history[account];
+        uint256 high = h.length;
+        uint256 low = 0;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (h[mid].blk > blockNumber) high = mid;
+            else low = mid + 1;
+        }
+        if (low != 0) c = h[low - 1];
+    }
+
+    /// The global point recorded in exactly `blockNumber`; reverts if there is none.
+    function _snapshot(uint256 blockNumber) private view returns (Point memory) {
+        if (blockNumber >= block.number) revert FutureLookup(blockNumber, block.number);
+        Point[] storage pts = _points[GLOBAL];
+        uint256 n = _pointsUpTo(pts, blockNumber);
+        if (n == 0 || pts[n - 1].blk != blockNumber) revert SnapshotNotRecorded(blockNumber);
+        return pts[n - 1];
+    }
+
+    /// Number of points written at or before `blockNumber`.
+    function _pointsUpTo(Point[] storage pts, uint256 blockNumber) private view returns (uint256 low) {
+        uint256 high = pts.length;
+        while (low < high) {
+            uint256 mid = (low + high) / 2;
+            if (pts[mid].blk > blockNumber) high = mid;
+            else low = mid + 1;
+        }
+    }
+
+    // ---------------------------------------------------------------- helpers
+
+    function _roundDown(uint64 t) private pure returns (uint64) {
+        return (t / EPOCH_LENGTH) * EPOCH_LENGTH;
+    }
+
+    function _checkDuration(uint64 nowTs, uint64 end) private pure {
+        if (end <= nowTs) revert LockDurationOutOfRange(0, MIN_LOCK, MAX_LOCK);
+        uint64 duration = end - nowTs;
+        if (duration < MIN_LOCK || duration > MAX_LOCK) {
+            revert LockDurationOutOfRange(duration, MIN_LOCK, MAX_LOCK);
+        }
+    }
+
+    function _u128(uint256 v) private pure returns (uint128) {
+        if (v > type(uint128).max) revert AmountTooLarge(v);
+        return uint128(v);
+    }
+
+    /// Credits what an account has earned on its CURRENT units, then freezes the debt.
+    function _settle(address account) private {
+        uint256 accrued = (_units[account] * _accQrlPerUnit) / ACC;
+        uint256 debt = _rewardDebt[account];
+        if (accrued > debt) _credited[account] += accrued - debt;
+        _rewardDebt[account] = accrued;
+    }
+
+    /// Recomputes an account's units from its live weight and rebases the aggregate.
+    function _resync(address account) private {
+        uint256 previous = _units[account];
+        uint256 current = weightOf(account);
+        _units[account] = current;
+        _rewardDebt[account] = (current * _accQrlPerUnit) / ACC;
+        _totalUnits = _totalUnits + current - previous;
+    }
+}

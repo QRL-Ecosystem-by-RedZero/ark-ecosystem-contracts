@@ -1,0 +1,602 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./interfaces/IArkTimelock.hyp";
+import "./interfaces/IArkStakeGovernable.hyp";
+import "./interfaces/IObjectionSource.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/ArkGovTables.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/// The accepting half of IGovernanceHandover (contracts/staking): what `acceptGovernanceOf` calls.
+interface IGovernanceAccept {
+    function acceptGovernance() external;
+}
+
+/**
+ * ArkTimelock — `governance` of ArkStakeParams, ArkStakeRegistry and
+ * ArkBondDelegation (design §6.1, §6.2, §7).
+ *
+ * WHY THIS ALONE CLOSES AUDIT D9
+ * ------------------------------
+ * The minimum delay is compiled in and looked up from the payload, so the S1
+ * multisig — before any governor exists — already cannot move the threat stage
+ * faster than one step per 30 days, cannot reprice the ladder around that rule
+ * (D5), and cannot move any of the 39 value-transfer keys sooner than 30 days or
+ * by more than a quarter of its range per operation (D7, EC-06). Every layer
+ * holds on its own (design N2): the target still
+ * checks ranges and relations; this contract checks pace.
+ *
+ * WHAT THE GUARDIAN CAN AND CANNOT DO (G14)
+ * -----------------------------------------
+ * Cancel a Queued operation. It cannot schedule, execute, pause, or touch
+ * anything that does not pass through here — in particular not the Q-Day
+ * ratification or the court's governance step, which never queue. The one
+ * exception is outside this contract: contracts/staking's valuation oracle
+ * reads `guardian()` and lets it pause the oracle directly, once, for
+ * `pauseMaxEpochs`; only an operation of this timelock (`pause()`, seven
+ * days, objectable at S1) renews it, and `renounceGuardian` ends it (yellow
+ * paper §6.1).
+ *
+ * NO FUNDS
+ * --------
+ * There is no `receive`. A payable operation is funded by whoever executes it,
+ * with exactly the value fixed at scheduling, so the timelock never holds QRL a
+ * captured proposer could route.
+ *
+ * LEG B OBJECTION AT S1 (design §6.8, D6 from S1 by EC-06)
+ * --------------------------------------------------------
+ * At S1 the proposer is a multisig and no vote follows, so the chamber the
+ * governor holds from S2 has nothing to act on. Here, an operation that writes
+ * a value-transfer key or steps the threat stage, scheduled before the first
+ * `handOver`, may be objected to by bond holders with the principal they held
+ * at the boundary opening the epoch it was queued in. Reaching
+ * `OBJECTION_THRESHOLD_BPS` of that epoch's total principal contests it: it is
+ * not executed when its delay elapses, but waits a second delay of its keys
+ * from the close of the objection, within which the guardian may cancel it. It
+ * is escalation, not a veto, as at S2. The yellow paper §4.5 "contested
+ * operation" row at S1: no quorum, no approval, twice the delay.
+ *
+ * The threshold is a constant at the design reference value (2,000 bps; the
+ * governor's S2 chamber takes it as an immutable). The constructor is
+ * unchanged, because contracts/staking redeploys this contract from its
+ * vendored artifact with (proposer, guardian).
+ *
+ * THE HANDOVER IS AN OPERATION (re-audit 2026-09-30, SWAPGOV-03)
+ * --------------------------------------------------------------
+ * `handOver` ends the S1 chamber, so it runs only as a 30-day self-operation,
+ * objectable at S1 like a value transfer, and only to the governor the
+ * proposer named once (`setGovernor`). The S1 multisig used to call it
+ * directly, to any account, and close the chamber at once.
+ *
+ * ONE QUEUED OPERATION PER KEY (re-audit 2026-09-30, SWAPGOV-04; GV-01)
+ * --------------------------------------------------------------------
+ * A keyed diff that names a key another Queued operation names is refused
+ * (`KeyPending`): the step of each operation is measured against its own
+ * `expected`, so concurrent operations chained their steps across a key's
+ * whole range after one delay.
+ *
+ * A STAGE STEP IN THE QUEUE IS PUBLIC (QL-25, PV-20)
+ * --------------------------------------------------
+ * `stageStepQueued()` is true while an operation that steps the threat stage
+ * (`setThreatStage`) of the caller is Queued: scheduled, not executed, not
+ * cancelled — counted per target since the re-audit of 2026-09-30
+ * (SWAPGOV-09), so a stage payload aimed at an account that is no parameter
+ * set holds no commitment shut. The staking parameter set asks for itself;
+ * the registry writes it into the allocation leaf, and the escrow refuses
+ * a term commitment while it stands, because a commitment made inside the
+ * thirty days would lock the rung the step is about to leave. It is a count
+ * kept on schedule, execute and cancel, plus the latest time a counted
+ * operation can still execute (eta + GRACE_PERIOD, moved by a contest). An
+ * operation that expires unexecuted is not uncounted, so the view also reads
+ * false once that latest time has passed, and the next stage step scheduled
+ * after it starts the count afresh. The one residue errs toward refusing: an
+ * operation that expired while a later one was queued stays counted until the
+ * later one's latest time (since OC-GOV-02 a later one cannot be queued while
+ * an earlier one is, so the residue no longer arises).
+ *
+ * AN ECOSYSTEM PHASE STEP IS A STAGE STEP FOR EVERY READER (2026-10-07)
+ * ---------------------------------------------------------------------
+ * `setPhase`, `enterQDay` and `restore` (ArkPhase, `QuantumArk-Phases.md`
+ * §3) move the phase every product reads, and through it Ark Staking's
+ * threat stage. They are counted once, for the network rather than for their
+ * target (there is one ArkPhase per network and the parameter set asking is
+ * never that target), so `stageStepQueued()` and `stageStepQueuedFor(any)`
+ * are true while one is Queued, and `phaseStepQueued()` reads that count
+ * alone. A phase payload aimed at an account that is not ArkPhase is counted
+ * as well: it holds commitments shut exactly as a real one would, which the
+ * proposer could schedule anyway, and the guardian cancels either. A
+ * `setPhase` or `restore` is refused (`StagePending`) while any phase
+ * operation is Queued; `enterQDay` never is, so the 48-hour defensive step
+ * cannot be held behind a 30-day one (ArkPhase itself refuses a second
+ * transition in one epoch). All three are objectable at S1 (Phases doc R2:
+ * Leg B and the guardian can stop a captured emergency step).
+ *
+ * ONE QUEUED STAGE STEP PER TARGET (OC round 2026-10-03, OC-GOV-02)
+ * -----------------------------------------------------------------
+ * A `setThreatStage` operation is refused (`StagePending`) while another for
+ * the same target is Queued. Counted only, the S1 multisig queued 1->2, 2->3
+ * and 3->4 at once, and with the target's one step per epoch stage 4 was in
+ * force some thirty days and two epochs later, where the papers promise three
+ * thirty-day delays in sequence.
+ *
+ * WHAT ENDS OR REDIRECTS A CHAMBER IS OBJECTABLE (OC-GOV-01)
+ * ----------------------------------------------------------
+ * Beside the stage and the value-transfer keys, an S1 operation that names
+ * `proposeGovernance` (a governed contract's next governance accepts and then
+ * answers to no timelock), `setObjectionSource` or `setCourt` (set once: a
+ * false value ends the S2 chamber or the court's terminal step for good) is
+ * objectable like the handover. `ruleFor` returns the flag beside the delay,
+ * so the governor reads the same set instead of mirroring it.
+ *
+ * ACCEPTING GOVERNANCE AT ONCE (OC-GOV-03)
+ * ----------------------------------------
+ * `acceptGovernanceOf(target)` lets anyone have this contract accept the
+ * governance a target has proposed to it, in the same transaction. Accepting
+ * only moves power INTO the delays, so it needs none of its own; the deployer
+ * of the staking leg proposes and has it accepted in one run, and no deployer
+ * key governs past it (the 48-hour `acceptGovernance()` row stays for a
+ * handover made the slow way).
+ *
+ * THE GUARDIAN'S LIMITS (GV-03, GV-17)
+ * ------------------------------------
+ * The guardian cannot cancel the operation that removes it (`renounceGuardian`)
+ * nor an uncontested handover, and it cannot renounce itself: only the S3
+ * operation removes it. The proposer and the guardian are distinct accounts.
+ */
+contract ArkTimelock is IArkTimelock {
+    uint64 public constant GRACE_PERIOD = 14 days;
+
+    /// Largest keyed diff one operation may carry; bounds the duplicate scan.
+    uint256 public constant MAX_DIFF = 32;
+
+    /// Leg B objection, as a share of bond principal, that contests an S1 operation (reference value).
+    uint16 public constant OBJECTION_THRESHOLD_BPS = 2000;
+
+    uint256 private constant BPS = 10000;
+
+    /// The count key of ecosystem phase steps in `_stageSteps` / `_stageUntil`: no target is zero.
+    address private constant PHASE_STEPS = address(0);
+
+    struct Op {
+        address target;
+        uint64 eta;
+        uint8 state;
+        /// Writes a value-transfer key or steps the stage, and was scheduled at S1.
+        bool objectable;
+        bool contested;
+        /// Steps the threat stage: counted by `stageStepQueued` while Queued.
+        bool stageStep;
+        /// Moves the ecosystem phase: counted under `PHASE_STEPS`, not its target.
+        bool phaseStep;
+        uint64 delay;
+        uint64 queueEpoch;
+        uint256 value;
+        uint256 objection;
+        bytes payload;
+    }
+
+    address public proposer;
+    address public guardian;
+    /// Leg B principal (IObjectionSource); set once.
+    address public objectionSource;
+    /// Set by the first `handOver`: from then on the governor's chamber covers what it queues.
+    bool public handedOver;
+    /// The one account `handOver` may name: contracts/core's ArkGovernor, set once (re-audit 2026-09-30, SWAPGOV-03).
+    address public governor;
+
+    mapping(bytes32 => Op) private _ops;
+    mapping(bytes32 => mapping(address => bool)) private _objected;
+    uint256 private _nonce;
+    /// Per target: stage steps scheduled and neither executed nor cancelled (expired ones included) (SWAPGOV-09).
+    mapping(address => uint64) private _stageSteps;
+    /// Per target: the latest eta + GRACE_PERIOD of a counted stage step.
+    mapping(address => uint64) private _stageUntil;
+    /// The operation that last named each parameter key; a key is pending while that one is Queued (SWAPGOV-04).
+    mapping(bytes32 => bytes32) private _keyOp;
+
+    constructor(address proposer_, address guardian_) {
+        if (proposer_ == address(0)) revert ZeroAddress();
+        // GV-17: the canceller is never the scheduler.
+        if (proposer_ == guardian_) revert ProposerIsGuardian(proposer_);
+        proposer = proposer_;
+        guardian = guardian_;
+    }
+
+    function schedule(address target, bytes calldata payload) external returns (bytes32 opId, uint64 eta) {
+        return _schedule(target, 0, payload);
+    }
+
+    function scheduleWithValue(address target, uint256 value, bytes calldata payload)
+        external
+        returns (bytes32 opId, uint64 eta)
+    {
+        return _schedule(target, value, payload);
+    }
+
+    function _schedule(address target, uint256 value, bytes calldata payload)
+        private
+        returns (bytes32 opId, uint64 eta)
+    {
+        if (msg.sender != proposer) revert NotProposer(msg.sender);
+        if (target == address(0)) revert ZeroAddress();
+        (uint64 delay, bool valueTransfer) = _delayOf(payload);
+        eta = uint64(block.timestamp) + delay;
+        opId = keccak256(abi.encode(target, value, keccak256(payload), ++_nonce));
+
+        Op storage op = _ops[opId];
+        op.target = target;
+        op.eta = eta;
+        op.state = uint8(OpState.Queued);
+        op.value = value;
+        op.payload = payload;
+        if (valueTransfer && !handedOver) {
+            op.objectable = true;
+            op.delay = delay;
+            op.queueEpoch = uint64(ArkEpoch.current());
+        }
+        bytes4 selector = bytes4(payload[:4]);
+        if (selector == ArkGovTables.SET_PARAMS_DIFF) _lockKeys(opId, payload);
+        if (selector == ArkGovTables.SET_THREAT_STAGE) {
+            // One Queued stage step per target (OC-GOV-02): steps run in sequence, each its own delay.
+            if (_stageQueued(target)) revert StagePending(target);
+            op.stageStep = true;
+            // Counted for its target alone (re-audit 2026-09-30, SWAPGOV-09).
+            // None is Queued (the refusal above): any count left is of steps
+            // that expired unexecuted, so the count starts afresh at one.
+            _stageSteps[target] = 1;
+            _noteStageUntil(target, eta);
+        } else if (
+            selector == ArkGovTables.SET_PHASE || selector == ArkGovTables.ENTER_QDAY || selector == ArkGovTables.RESTORE
+        ) {
+            // One ecosystem phase count for every reader (2026-10-07). The
+            // defensive enterQDay is never held behind a queued phase step.
+            bool queued = _stageQueued(PHASE_STEPS);
+            if (queued && selector != ArkGovTables.ENTER_QDAY) revert StagePending(target);
+            op.stageStep = true;
+            op.phaseStep = true;
+            if (queued) {
+                _stageSteps[PHASE_STEPS] += 1;
+                _noteStageUntil(PHASE_STEPS, eta);
+            } else {
+                // Nothing counted is Queued: restart both, so the latest time of a
+                // cancelled 30-day step does not outlive a later 48-hour one.
+                _stageSteps[PHASE_STEPS] = 1;
+                _stageUntil[PHASE_STEPS] = eta + GRACE_PERIOD;
+            }
+        }
+        emit Scheduled(opId, target, selector, value, eta, delay, payload);
+    }
+
+    /**
+     * One queued operation per parameter key (re-audit 2026-09-30,
+     * SWAPGOV-04; GV-01): a keyed diff naming a key that an operation still
+     * Queued also names is refused (`KeyPending`), so concurrent operations
+     * can no longer chain their quarter-steps — four of them used to walk a
+     * key across its whole range after one delay, in one block. An operation
+     * executed, cancelled or expired frees its keys. The payload was decoded
+     * and checked by `_delayOf`.
+     */
+    function _lockKeys(bytes32 opId, bytes calldata payload) private {
+        IArkStakeGovernable.ParamChange[] memory changes =
+            abi.decode(payload[4:], (IArkStakeGovernable.ParamChange[]));
+        for (uint256 i = 0; i < changes.length; i++) {
+            bytes32 k = changes[i].key;
+            bytes32 prev = _keyOp[k];
+            if (prev != bytes32(0) && stateOf(prev) == OpState.Queued) revert KeyPending(k, prev);
+            _keyOp[k] = opId;
+        }
+    }
+
+    function execute(bytes32 opId) external payable returns (bytes memory result) {
+        Op storage op = _ops[opId];
+        OpState s = stateOf(opId);
+        if (s != OpState.Queued) revert OpNotQueued(opId, uint8(s));
+        if (block.timestamp < op.eta) revert NotReady(op.eta, uint64(block.timestamp));
+        if (msg.value != op.value) revert ValueMismatch(op.value, msg.value);
+
+        op.state = uint8(OpState.Executed);
+        if (op.stageStep) _uncountStageStep(_stageKey(op));
+        bool ok;
+        (ok, result) = op.target.call{value: msg.value}(op.payload);
+        if (!ok) revert CallFailed(opId, result);
+        emit Executed(opId, msg.sender);
+    }
+
+    function cancel(bytes32 opId) external {
+        if (msg.sender != proposer && (msg.sender != guardian || guardian == address(0))) {
+            revert NotProposerOrGuardian(msg.sender);
+        }
+        OpState s = stateOf(opId);
+        if (s != OpState.Queued) revert OpNotQueued(opId, uint8(s));
+        Op storage op = _ops[opId];
+        if (msg.sender != proposer && op.target == address(this)) _guardianMayCancel(opId, op);
+        op.state = uint8(OpState.Cancelled);
+        if (op.stageStep) _uncountStageStep(_stageKey(op));
+        emit Cancelled(opId, msg.sender);
+    }
+
+    /**
+     * GV-03: the guardian cannot keep itself. It never cancels the S3
+     * operation that removes it, and cancels a handover only once Leg B has
+     * contested it (its S1 chamber role); an uncontested handover is the
+     * proposer's to withdraw.
+     */
+    function _guardianMayCancel(bytes32 opId, Op storage op) private view {
+        bytes memory p = op.payload;
+        bytes4 s;
+        if (p.length >= 4) s = bytes4(p[0]) | (bytes4(p[1]) >> 8) | (bytes4(p[2]) >> 16) | (bytes4(p[3]) >> 24);
+        if (s == ArkGovTables.RENOUNCE_GUARDIAN || (s == ArkGovTables.HAND_OVER && !op.contested)) {
+            revert GuardianCannotCancel(opId);
+        }
+    }
+
+    /**
+     * @inheritdoc IArkTimelock
+     * @dev For the CALLER as the target (re-audit 2026-09-30, SWAPGOV-09): the
+     *      staking parameter set asks for itself, so a stage payload aimed at
+     *      any other account — one that can never move a stage there — holds
+     *      nothing. `stageStepQueuedFor` reads any target.
+     */
+    function stageStepQueued() external view returns (bool) {
+        return stageStepQueuedFor(msg.sender);
+    }
+
+    /// @inheritdoc IArkTimelock
+    function stageStepQueuedFor(address target) public view returns (bool) {
+        return _stageQueued(target) || _stageQueued(PHASE_STEPS);
+    }
+
+    /// @inheritdoc IArkTimelock
+    function phaseStepQueued() external view returns (bool) {
+        return _stageQueued(PHASE_STEPS);
+    }
+
+    function _stageQueued(address k) private view returns (bool) {
+        return _stageSteps[k] != 0 && block.timestamp <= _stageUntil[k];
+    }
+
+    /// Where an operation's stage step is counted: its target, or the one phase count.
+    function _stageKey(Op storage op) private view returns (address) {
+        return op.phaseStep ? PHASE_STEPS : op.target;
+    }
+
+    function _uncountStageStep(address target) private {
+        uint64 steps = _stageSteps[target];
+        // An expired step can neither execute nor be cancelled, so a count
+        // restarted after one never goes below zero; the guard is defensive.
+        if (steps != 0) _stageSteps[target] = steps - 1;
+    }
+
+    function _noteStageUntil(address target, uint64 eta) private {
+        uint64 until = eta + GRACE_PERIOD;
+        if (until > _stageUntil[target]) _stageUntil[target] = until;
+    }
+
+    /**
+     * Names the governor `handOver` hands the proposer role to, once, by the
+     * proposer (S1). A false name gains nothing: the handover to it is still
+     * a 30-day operation Leg B can contest and the guardian can cancel.
+     */
+    function setGovernor(address governor_) external {
+        if (msg.sender != proposer) revert NotProposer(msg.sender);
+        if (governor != address(0)) revert AlreadySet(governor);
+        if (governor_ == address(0) || governor_ == address(this)) revert ZeroAddress();
+        governor = governor_;
+        emit GovernorSet(governor_);
+    }
+
+    /**
+     * Hands the proposer role to the governor. One-way (G15): the previous
+     * proposer keeps nothing, and no function restores it.
+     *
+     * @dev Only as a 30-day self-operation, and only to `governor` (re-audit
+     *      2026-09-30, SWAPGOV-03): scheduled at S1 it is objectable by Leg B
+     *      like any value-transfer operation, since the handover ends the S1
+     *      chamber. Called directly, the S1 multisig handed the role to any
+     *      key it held and closed the chamber for good, with no governor, no
+     *      vote and no delay (GV-13, GV-17).
+     */
+    function handOver(address newProposer) external {
+        if (msg.sender != address(this)) revert NotProposer(msg.sender);
+        if (newProposer == address(0) || newProposer != governor) revert NotGovernor(newProposer);
+        if (newProposer == proposer) revert SameProposer(newProposer);
+        emit ProposerHandedOver(proposer, newProposer);
+        proposer = newProposer;
+        handedOver = true;
+    }
+
+    /**
+     * Wires Leg B's principal, once. The S1 proposer may call it directly, so the
+     * chamber is open from the start of S1 rather than 30 days into it; the
+     * timelock itself may through a 30-day self-operation (the governor never
+     * calls it). A captured proposer that points it at a false source gains
+     * nothing it would not gain by never wiring it, and does so in public.
+     */
+    function setObjectionSource(address source) external {
+        if (msg.sender != proposer && msg.sender != address(this)) revert NotProposer(msg.sender);
+        if (objectionSource != address(0)) revert AlreadySet(objectionSource);
+        if (source == address(0)) revert ZeroAddress();
+        objectionSource = source;
+        emit ObjectionSourceSet(source);
+    }
+
+    /**
+     * A Leg B holder objects to a Queued S1 value-transfer operation, once, with
+     * the principal it held at the boundary that opened the queue epoch: principal
+     * subscribed after the operation became visible cannot object, and a transfer
+     * during the window cannot count the same principal twice. At the threshold
+     * the operation is contested and its eta moves to now + its delay.
+     */
+    function object(bytes32 opId) external {
+        address src = objectionSource;
+        if (src == address(0)) revert ObjectionSourceUnset();
+        Op storage op = _ops[opId];
+        if (!op.objectable || op.contested) revert OpNotObjectable(opId);
+        OpState s = stateOf(opId);
+        if (s != OpState.Queued) revert OpNotQueued(opId, uint8(s));
+        if (_objected[opId][msg.sender]) revert OpAlreadyObjected(opId, msg.sender);
+
+        uint256 w = IObjectionSource(src).principalAt(msg.sender, op.queueEpoch);
+        if (w == 0) revert NoPrincipal(msg.sender);
+        _objected[opId][msg.sender] = true;
+        uint256 objection = op.objection + w;
+        op.objection = objection;
+        emit OpObjected(opId, msg.sender, w, objection);
+
+        uint256 total = IObjectionSource(src).totalPrincipalAt(op.queueEpoch);
+        if (objection * BPS >= uint256(OBJECTION_THRESHOLD_BPS) * total) {
+            op.contested = true;
+            uint64 eta = uint64(block.timestamp) + op.delay;
+            op.eta = eta;
+            if (op.stageStep) _noteStageUntil(_stageKey(op), eta);
+            emit OpContested(opId, eta);
+        }
+    }
+
+    /**
+     * Removes the guardian for good (S3, design §7). No setter re-creates it.
+     * Only as the timelock's own 30-day operation, the RenounceAdmin vote's:
+     * the guardian used to renounce itself directly, ending the S1 and S2
+     * cancel power without the S3 condition (GV-03).
+     */
+    function renounceGuardian() external {
+        if (msg.sender != address(this)) revert NotGuardian(msg.sender);
+        emit GuardianRenounced(guardian);
+        guardian = address(0);
+    }
+
+    /**
+     * Has `target` hand its governance to this timelock now (OC-GOV-03):
+     * calls `target.acceptGovernance()`, which succeeds only where the
+     * target's own governance proposed this contract. Anyone may: accepting
+     * moves the target under every delay of the table and away from whoever
+     * governed it, so it is not itself delayed. The deployer of the staking
+     * leg proposes and has it accepted in the same run, leaving no window in
+     * which its key governs and no `pendingGovernance` behind.
+     */
+    function acceptGovernanceOf(address target) external {
+        IGovernanceAccept(target).acceptGovernance();
+        emit GovernanceAccepted(target, msg.sender);
+    }
+
+    function delayFor(bytes calldata payload) external pure returns (uint64 delay) {
+        (delay,) = _delayOf(payload);
+    }
+
+    /// The delay and whether the payload is one the Leg B chamber watches (OC-GOV-01): the governor's one source.
+    function ruleFor(bytes calldata payload) external pure returns (uint64 delay, bool valueTransfer) {
+        return _delayOf(payload);
+    }
+
+    function objectionOf(bytes32 opId)
+        external
+        view
+        returns (bool objectable, bool contested, uint64 queueEpoch, uint256 objection)
+    {
+        Op storage op = _ops[opId];
+        return (op.objectable, op.contested, op.queueEpoch, op.objection);
+    }
+
+    function keyRule(bytes32 key) external pure returns (uint64 delay, uint256 step) {
+        return ArkGovTables.ruleOfKey(key);
+    }
+
+    function stateOf(bytes32 opId) public view returns (OpState) {
+        Op storage op = _ops[opId];
+        OpState s = OpState(op.state);
+        if (s == OpState.Queued && block.timestamp > uint256(op.eta) + GRACE_PERIOD) return OpState.Expired;
+        return s;
+    }
+
+    function etaOf(bytes32 opId) external view returns (uint64) {
+        return _ops[opId].eta;
+    }
+
+    function opOf(bytes32 opId) external view returns (address target, uint256 value, uint64 eta, bytes memory payload) {
+        Op storage op = _ops[opId];
+        return (op.target, op.value, op.eta, op.payload);
+    }
+
+    /**
+     * The table lookup, plus the two pace rules a payload can be checked for here.
+     *
+     * For a keyed diff: every key must be known, none may repeat (a repeat would
+     * let one operation walk a key twice its step), and a value-transfer key may
+     * move at most its step from the value the proposer declared as `expected`.
+     * `expected` is the target's compare-and-swap operand, so a step measured
+     * against it is a step measured against the value actually replaced.
+     *
+     * For a stage move: exactly one step, which the target checks as well.
+     * For an ecosystem phase move: `setPhase` one step within 0..2 and
+     * `enterQDay` from 0..2 (ArkPhase checks both against the phase in force).
+     *
+     * `valueTransfer` is true for a stage move, for the three phase moves, for a diff that names at
+     * least one key with a step, and for `handOver`, `proposeGovernance`,
+     * `setObjectionSource` and `setCourt` (OC-GOV-01) and the valuation
+     * oracle's `pause()` renewal: the operations the Leg B chamber watches. A
+     * step flagged `RELATIVE` (the oracle's `arkReferencePrice`) bounds the move
+     * to that many bps of `expected`.
+     */
+    function _delayOf(bytes calldata payload) private pure returns (uint64 delay, bool valueTransfer) {
+        if (payload.length < 4) revert PayloadTooShort(payload.length);
+        bytes4 selector = bytes4(payload[:4]);
+        delay = ArkGovTables.delayOfSelector(selector);
+        if (delay == 0) revert UnknownSelector(selector);
+
+        if (selector == ArkGovTables.SET_THREAT_STAGE) {
+            (uint8 fromStage, uint8 toStage) = abi.decode(payload[4:], (uint8, uint8));
+            uint256 f = fromStage;
+            uint256 t = toStage;
+            if (t != f + 1 && t + 1 != f) revert StageStepInvalid(fromStage, toStage);
+            valueTransfer = true;
+        } else if (selector == ArkGovTables.SET_PHASE) {
+            (uint8 fromPhase, uint8 toPhase) = abi.decode(payload[4:], (uint8, uint8));
+            uint256 f = fromPhase;
+            uint256 t = toPhase;
+            if (f > 2 || t > 2 || (t != f + 1 && t + 1 != f)) revert StageStepInvalid(fromPhase, toPhase);
+            valueTransfer = true;
+        } else if (selector == ArkGovTables.ENTER_QDAY) {
+            uint8 fromPhase = abi.decode(payload[4:], (uint8));
+            if (fromPhase > 2) revert StageStepInvalid(fromPhase, 3);
+            valueTransfer = true;
+        } else if (selector == ArkGovTables.RESTORE) {
+            valueTransfer = true;
+        } else if (
+            selector == ArkGovTables.HAND_OVER || selector == ArkGovTables.PROPOSE_GOVERNANCE
+                || selector == ArkGovTables.SET_OBJECTION_SOURCE || selector == ArkGovTables.SET_COURT
+                || selector == ArkGovTables.PAUSE
+        ) {
+            // The handover ends the S1 chamber: objectable like a value transfer (SWAPGOV-03).
+            // So does what hands a governed contract to another governance, or sets a
+            // chamber's source or the governor's court once (OC-GOV-01). A pause renewal
+            // prolongs the oracle's silence past what the guardian may impose alone.
+            valueTransfer = true;
+        } else if (delay == ArkGovTables.KEYED) {
+            IArkStakeGovernable.ParamChange[] memory changes =
+                abi.decode(payload[4:], (IArkStakeGovernable.ParamChange[]));
+            uint256 n = changes.length;
+            if (n == 0) revert EmptyDiff();
+            if (n > MAX_DIFF) revert DiffTooLarge(n, MAX_DIFF);
+            delay = 0;
+            for (uint256 i = 0; i < n; i++) {
+                IArkStakeGovernable.ParamChange memory c = changes[i];
+                (uint64 d, uint256 step) = ArkGovTables.ruleOfKey(c.key);
+                if (d == 0) revert UnknownKey(c.key);
+                for (uint256 j = 0; j < i; j++) {
+                    if (changes[j].key == c.key) revert DuplicateKey(c.key);
+                }
+                if (step != 0) {
+                    uint256 moved = c.value > c.expected ? c.value - c.expected : c.expected - c.value;
+                    // A relative step (arkReferencePrice): bps of the value replaced.
+                    bool over = (step & ArkGovTables.RELATIVE) != 0
+                        ? moved * BPS > c.expected * (step ^ ArkGovTables.RELATIVE)
+                        : moved > step;
+                    if (over) revert StepTooLarge(c.key, c.expected, c.value, step);
+                    valueTransfer = true;
+                }
+                if (d > delay) delay = d;
+            }
+        }
+    }
+}

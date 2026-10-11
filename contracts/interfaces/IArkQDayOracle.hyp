@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The Q-Day state Ark Staking reads (staking `IArkStakeExternal.IQDayOracle`,
+ * yellow paper §1.3). Byte-for-byte the three views the bond and the registry
+ * call; nothing in Ark Staking ever writes this state (whitepaper §6.2).
+ */
+interface IArkQDayState {
+    /// True once Q-Day has been certified 5-of-9 and ratified. Irreversible.
+    function declared() external view returns (bool);
+
+    /// True from the first attester's advisory until it lapses or is rejected; stays true once declared.
+    function frozen() external view returns (bool);
+
+    /// Timestamp of the ratification, or zero.
+    function declaredAt() external view returns (uint64);
+}
+
+/**
+ * The Q-Day oracle of the protocol (design §6.6; staking yellow paper §4.1).
+ *
+ *   Normal ──advisory(1 attester)──> Advisory ──5 of 9 certify within 24h──> Certified
+ *      ^                                │                                        │
+ *      └──── lapse (no quorum in 24h) ──┘                                        │
+ *      └──────────────────── ratification rejected ─────────────────────────────┤
+ *                                                   ratified ──> Declared (final)
+ *
+ * The advisory freezes at once and moves nothing. Only a certification can be
+ * put to veARK, and veARK can only ratify or reject it: governance confirms an
+ * event bonded attesters started, it never starts one (N4, G7).
+ */
+interface IArkQDayOracle is IArkQDayState {
+    enum State {
+        Normal,
+        Advisory,
+        Certified,
+        Declared
+    }
+
+    event AdvisoryRaised(uint256 indexed round, address indexed attester, bytes32 artefactHash);
+    event CertificationAdded(uint256 indexed round, address indexed attester, uint8 count);
+    event CertificationReached(uint256 indexed round, uint64 at);
+    event AdvisoryLapsed(uint256 indexed round);
+    event Resolved(uint256 indexed round, bool ratified);
+    event AttesterAdded(address indexed attester);
+    event AttesterRemoved(address indexed attester);
+    event BondPosted(address indexed attester, uint256 amount, uint256 total);
+    event BondWithdrawn(address indexed attester, uint256 amount);
+    event AttesterSlashed(address indexed attester, uint256 amount, address indexed to);
+    event GovernorSet(address indexed governor);
+
+    error NotAttester(address caller);
+    error BondTooLow(address attester, uint256 bond, uint256 required);
+    error InvalidPhase(uint8 state);
+    error OnCooldown(address attester, uint64 until);
+    error AlreadyCertified(address attester);
+    error WindowClosed(uint64 closedAt);
+    error WindowOpen(uint64 closesAt);
+    error StaleRound(uint256 requested, uint256 current);
+    error PanelFull(uint256 size);
+    error AlreadyAttester(address attester);
+    error BondLocked(uint64 until);
+    error OnlyTimelock(address caller);
+    error OnlyGovernor(address caller);
+    error OnlyCourt(address caller);
+    error OnlyDeployer(address caller);
+    error AlreadySet(address current);
+    error NothingToWithdraw(address caller);
+
+    function state() external view returns (State);
+
+    /// Increments with each advisory; a ratification names the round it ratifies.
+    function round() external view returns (uint256);
+
+    /// Governor only, and only in state Certified for the current round.
+    function resolve(uint256 round_, bool ratified) external;
+}

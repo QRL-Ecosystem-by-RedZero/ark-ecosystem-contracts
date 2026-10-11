@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * veARK — time-locked ARK, the unit of governance weight and jury eligibility.
+ *
+ * WHY LOCKING IS MANDATORY FOR GOVERNANCE
+ * ---------------------------------------
+ * An insurance protocol's liabilities are long-dated: a policy written today
+ * may pay out years from now, and Q-Day itself is an event nobody can schedule.
+ * A voter whose position can be sold tomorrow has no reason to weigh a loss
+ * that lands in year four. Locking forces the voter's horizon to match the
+ * protocol's, which is the only alignment mechanism available that does not
+ * rely on goodwill.
+ *
+ * veARK IS THE ONLY SOURCE OF VOTES
+ * ---------------------------------
+ * The governor reads this contract and nothing else. `IArkToken.getVotes` still
+ * exists, but no vote is counted from it: two vote sources would let the same
+ * ARK be counted once raw and once locked.
+ *
+ * DESIGN LIMITS, AND WHY EACH EXISTS
+ * ----------------------------------
+ *   - Boost is capped at 4x. Uncapped boost turns governance into a contest
+ *     between a handful of maximum-duration lockers.
+ *   - Lock positions are NON-TRANSFERABLE. A transferable lock is just a
+ *     tradable vote with extra steps, and it re-creates the vote-buying market
+ *     that locking was meant to close.
+ *   - Delegation is revocable at any time AND overridable: a delegator who votes
+ *     in person takes its own weight back from the delegatee for that proposal,
+ *     even after the snapshot. A bought delegation therefore never stays bought.
+ *   - Weight used in a vote is pinned: the lock cannot be withdrawn until the
+ *     decision it voted on could have taken effect.
+ *
+ * Weight decays linearly as the lock approaches expiry: a lock with one week
+ * left should not vote like a lock with four years left, because it no longer
+ * carries the same exposure to the consequences.
+ *
+ * SNAPSHOTS
+ * ---------
+ * Every `...At(blk)` read takes a SNAPSHOT block: one in which `checkpoint()`
+ * ran, so that the contract recorded that block's timestamp next to the global
+ * totals. Weight is a function of time, and a contract cannot look up the
+ * timestamp of an arbitrary past block, so only recorded blocks are readable.
+ * The governor opens every voting round with `checkpoint()` and uses that block.
+ */
+interface IVeArk {
+    /// A single non-transferable lock position. `end` always sits on an epoch boundary.
+    struct Lock {
+        uint256 amount;
+        uint64 start;
+        uint64 end;
+    }
+
+    event LockCreated(address indexed account, uint256 amount, uint64 unlockTime);
+    event LockIncreased(address indexed account, uint256 addedAmount, uint256 newAmount);
+    event LockExtended(address indexed account, uint64 previousUnlock, uint64 newUnlock);
+    event Withdrawn(address indexed account, uint256 amount);
+
+    /// `account` moved its lock's voting weight from `fromDelegate` to `toDelegate`.
+    event DelegateChanged(address indexed account, address indexed fromDelegate, address indexed toDelegate);
+
+    /// `account` cannot withdraw before `until` because weight it controls was used to vote.
+    event PinRaised(address indexed account, uint64 until);
+
+    /// Until `voteEnd`, every lock delegated to someone else is held until `until`.
+    event DelegatedHold(uint64 voteEnd, uint64 until);
+
+    /// The one address allowed to pin voters was fixed. It can never change again.
+    event GovernorSet(address governor);
+
+    /// Requested lock duration, after rounding to an epoch boundary, is outside [MIN_LOCK, MAX_LOCK].
+    error LockDurationOutOfRange(uint64 requested, uint64 minimum, uint64 maximum);
+
+    /// The account already holds a lock; use `increaseAmount` or `extendLock`.
+    error LockAlreadyExists(address account);
+
+    /// No lock exists for the account.
+    error NoLock(address account);
+
+    /// Withdrawal was attempted before the lock matured.
+    error LockNotExpired(uint64 unlockTime, uint64 currentTime);
+
+    /// A lock may only be extended, never shortened.
+    error LockCannotShorten(uint64 currentUnlock, uint64 requestedUnlock);
+
+    /// veARK positions cannot be transferred; the token is soulbound by design.
+    error NonTransferable();
+
+    /// Aggregate weight was queried for a block that has not been mined yet.
+    error FutureLookup(uint256 requestedBlock, uint256 currentBlock);
+
+    /// No `checkpoint()` ran in this block, so its timestamp and totals were never recorded.
+    error SnapshotNotRecorded(uint256 blockNumber);
+
+    /// Protocol-owned ARK (treasury, backstop, incentives, timelock) holds no vote.
+    error ProtocolOwned(address account);
+
+    /// The lock matured, but a vote cast with its weight has not yet taken effect.
+    error VotePinned(address account, uint64 until, uint64 currentTime);
+
+    /// The lock is already delegated to this address.
+    error AlreadyDelegated(address delegatee);
+
+    /// Only the deployer may fix the governor, and only once.
+    error NotDeployer(address caller);
+
+    /// The governor has already been fixed.
+    error GovernorAlreadySet(address governor);
+
+    /// Only the governor may pin voters.
+    error NotGovernor(address caller);
+
+    /// Shortest permitted lock.
+    function MIN_LOCK() external view returns (uint64);
+
+    /// Longest permitted lock, and the duration that earns the maximum boost.
+    function MAX_LOCK() external view returns (uint64);
+
+    /// Voting-round length; lock ends are rounded down to a multiple of it.
+    function EPOCH_LENGTH() external view returns (uint64);
+
+    /// Maximum weight multiplier, in basis points (40000 = 4x).
+    function MAX_BOOST_BPS() external view returns (uint16);
+
+    /**
+     * Locks `amount` of ARK until `unlockTime`, rounded DOWN to an epoch boundary.
+     *
+     * @dev The lock is delegated to its owner until `delegate` says otherwise.
+     *      Reverts with `ProtocolOwned` for the addresses fixed at deployment.
+     * @param amount ARK to lock; transferred from the caller.
+     * @param unlockTime Requested maturity. The stored end is `floor(unlockTime / EPOCH_LENGTH) * EPOCH_LENGTH`.
+     */
+    function createLock(uint256 amount, uint64 unlockTime) external;
+
+    /// @notice Adds ARK to an existing lock without changing its unlock time.
+    function increaseAmount(uint256 amount) external;
+
+    /// @notice Extends an existing lock, rounded down to an epoch boundary. Shortening is impossible.
+    function extendLock(uint64 newUnlockTime) external;
+
+    /// @notice Withdraws a matured lock in full, once no vote pin holds it. Partial early exit does not exist.
+    function withdraw() external;
+
+    /**
+     * Moves the caller's lock weight to `to`. `to == msg.sender` takes it back.
+     *
+     * @dev One level only: `to` votes with the locks delegated to it, never with
+     *      locks delegated to whoever `to` delegates to. The caller inherits the
+     *      old delegatee's pin and, while a vote window is open, the window's
+     *      hold (`holdDelegated`), so switching delegatee is never a way out of
+     *      a vote cast, or still to be cast, with this weight.
+     * @param to The address that will vote with this lock.
+     */
+    function delegate(address to) external;
+
+    /**
+     * Records the global totals and this block's timestamp. Permissionless.
+     *
+     * @dev Makes the current block a readable snapshot for every `...At` view.
+     *      Cost is bounded by the number of epoch boundaries crossed since the
+     *      last write that still had live locks to expire.
+     */
+    function checkpoint() external;
+
+    /**
+     * Holds `voter`'s lock, and every lock delegated to `voter`, until `until`.
+     *
+     * @dev Governor only. Raises, never lowers: an earlier `until` is a no-op.
+     *      Touches no balance and no weight.
+     */
+    function pinUntil(address voter, uint64 until) external;
+
+    /**
+     * Opens a vote window: until `voteEnd`, every lock delegated to someone
+     * other than its owner is held until `until`, and a lock that leaves such
+     * a delegatee in that time keeps `until` as its own pin.
+     *
+     * @dev Governor only, sent when a round or off-round track takes its
+     *      snapshot; `voteEnd` is the latest time a vote can be cast there and
+     *      `until` the latest time any of its proposals can take effect. The
+     *      delegatee counts its snapshot power whenever it votes, so the weight
+     *      is committed from the snapshot, not from the delegatee's vote.
+     *      Overlapping windows merge (later end, later horizon); a window
+     *      opened after all others closed replaces them.
+     */
+    function holdDelegated(uint64 voteEnd, uint64 until) external;
+
+    /// @param account The locker being queried.
+    /// @return The stored lock position.
+    function lockOf(address account) external view returns (Lock memory);
+
+    /// @param account The locker being queried.
+    /// @return The address currently voting with `account`'s lock, or zero with no lock.
+    function delegateeOf(address account) external view returns (address);
+
+    /// @param account The account being queried.
+    /// @return Earliest time `account` may withdraw on account of votes (own, delegatee's, or an open window's hold).
+    function pinOf(address account) external view returns (uint64);
+
+    /// @return voteEnd End of the open vote window (in the past when none is open).
+    /// @return until Horizon delegated locks are held to while it is open.
+    function delegatedHold() external view returns (uint64 voteEnd, uint64 until);
+
+    /**
+     * Current weight of the caller's OWN lock, after boost and time decay.
+     *
+     * @param account The locker being queried.
+     * @return Weight in the same units as ARK, scaled by the 1x-4x boost.
+     */
+    function weightOf(address account) external view returns (uint256);
+
+    /// @param delegatee The account being queried.
+    /// @return Live weight of every lock currently delegated to `delegatee`, its own included.
+    function votingPowerOf(address delegatee) external view returns (uint256);
+
+    /**
+     * Weight used when drawing jurors for a dispute.
+     *
+     * @dev Read together with IStakingVault: jury draw weight is a function of
+     *      BOTH tier-scoped stake and veARK. A large veARK position with no
+     *      stake in a tier cannot judge that tier's disputes, because it would
+     *      not lose anything if the verdict were wrong. Never includes weight
+     *      delegated in: a juror's bonus is their own lock only.
+     * @param account The candidate juror.
+     * @return The veARK component of that account's draw weight.
+     */
+    function juryWeightOf(address account) external view returns (uint256);
+
+    /// @param account The locker being queried.
+    /// @param blockNumber A recorded snapshot block.
+    /// @return Weight of `account`'s own lock at the snapshot.
+    function weightAt(address account, uint256 blockNumber) external view returns (uint256);
+
+    /// @param account The locker being queried.
+    /// @param blockNumber A recorded snapshot block.
+    /// @return The address voting with `account`'s lock at the snapshot, or zero with no lock.
+    function delegateeAt(address account, uint256 blockNumber) external view returns (address);
+
+    /// @param delegatee The account being queried.
+    /// @param blockNumber A recorded snapshot block.
+    /// @return Weight of every lock delegated to `delegatee` at the snapshot.
+    function votingPowerAt(address delegatee, uint256 blockNumber) external view returns (uint256);
+
+    /**
+     * Exact total weight at a snapshot, the quorum denominator.
+     *
+     * @dev Never less than the sum of `votingPowerAt` over all delegatees, and
+     *      never less than the sum of `weightAt` over all locks: each is floored
+     *      once here and once per term there. The gap is below one wei per lock
+     *      and makes quorum marginally harder to reach.
+     * @param blockNumber A recorded snapshot block.
+     * @return Total veARK weight at that snapshot.
+     */
+    function totalWeightAt(uint256 blockNumber) external view returns (uint256);
+
+    event DividendDistributed(uint256 amount, uint256 accQrlPerUnit, uint256 totalUnits);
+    event DividendClaimed(address indexed account, uint256 amount);
+    event WeightSynced(address indexed account, uint256 previousUnits, uint256 newUnits);
+
+    /// Nothing is currently claimable for this account.
+    error NothingToClaim(address account);
+
+    /// A dividend arrived while no lock exists to receive it.
+    error NoLockedWeight();
+
+    /**
+     * Pays the veARK dividend slice into the contract.
+     *
+     * @dev This is the 5% of premium that tokenomics assigns to lockers, settled
+     *      in NATIVE QRL rather than in newly minted ARK. A locker's return is a
+     *      share of real revenue, not dilution of everyone else — which is the
+     *      whole basis for ARK having value without being the claim-paying asset.
+     *
+     *      In production the caller is ICapitalPool, and only after the
+     *      solvency-first rule has decided this slice is payable at all: below
+     *      the reserve target, or while recovery debt is outstanding, nothing
+     *      reaches here. Ark Staking never pays into it.
+     *
+     *      Dividends follow the lock OWNER, never the delegatee: delegating a
+     *      vote does not hand over the income.
+     */
+    function distributeDividend() external payable;
+
+    /// @notice Pays out everything accrued to the caller.
+    function claimDividend() external returns (uint256 amount);
+
+    /// @param account The locker being queried.
+    /// @return QRL claimable right now.
+    function pendingDividend(address account) external view returns (uint256);
+
+    /**
+     * Brings an account's weight units in line with its decayed live weight.
+     *
+     * @dev Permissionless. Dividends are denominated in units, which move only
+     *      when a transaction touches the lock, so an untouched lock keeps its
+     *      opening weight and over-earns. Anyone may correct that, and every
+     *      other locker gains when they do. Voting never reads units.
+     * @param account The locker to refresh.
+     */
+    function syncWeight(address account) external;
+
+    /// @param account The locker being queried.
+    /// @return Weight as of that account's last sync — the unit dividends are paid on.
+    function unitsOf(address account) external view returns (uint256);
+}

@@ -1,0 +1,348 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The compiled-in tables of the governance stack (design §6.2, decisions D5, D7).
+ *
+ * THE ONE RULE: A DELAY IS LOOKED UP, NEVER SUPPLIED
+ * --------------------------------------------------
+ * The timelock computes the minimum delay of an operation from its selector and,
+ * for a keyed parameter diff, from the keys in its payload. Nothing that calls
+ * the timelock passes a delay, and nothing here has a default: a selector or a
+ * key absent from these tables cannot be scheduled at all. A table with a
+ * fallback row would turn every new setter on a target into a 14-day change
+ * nobody reviewed.
+ *
+ * Changing a row is a redeployment of the timelock, which is deliberate: the
+ * delay is the promise to the people who can exit, and a promise a vote could
+ * shorten is the D9 finding again.
+ *
+ * KEYS
+ * ----
+ * `keccak256(bytes("<ArkStakeParams.Params field name>"))`. The names are those
+ * of `ARK_STAKING` in the site's `protocol-config.ts`, which the staking
+ * `Params` struct must carry byte for byte (design §6.2 requires every key in
+ * `Params` before the timelock is deployed). On 2026-09-30 the slope key became
+ * `premiumSlopeRatioBps` (EC-07: the slope is rho * sigma_t, no longer a bps of
+ * its own), and `firstReserveDiscountBps`, `bufferRampThresholdBps`,
+ * `offeringBatchMultiple` and `claimCostGwei` were added; on 2026-10-06 the
+ * Cushion's `cushionTargetBps` and `cushionCeilingBps` (staking technical
+ * reference §3.2, §3.3). CLAUDE.md §7.5 lists every key.
+ *
+ * PER-PHASE KEYS (2026-10-07, `QuantumArk-Phases.md` §3.1)
+ * --------------------------------------------------------
+ * A field Ark Staking holds once per ecosystem phase is keyed
+ * keccak256 of the field name, an at sign and the phase digit p = 0..4
+ * (`K_CUSHION_TARGET_P3` hashes the string cushionTargetBps, at sign, 3): one cell of
+ * the `PhaseRow[5]` the target compiles in at deployment. Each cell keeps the
+ * delay and step of the flat key it replaces. `admittedTermsMask`,
+ * `cushionTargetBps` and `cushionCeilingBps` exist only per phase since then;
+ * their flat keys have no row.
+ *
+ * STEP LIMITS (D7) AND THE VALUE-TRANSFER SET (design §6.8)
+ * ---------------------------------------------------------
+ * The value-transfer keys, 49 of them besides the threat stage (EC-06, then
+ * PV-05 / PV-19, 2026-09-30; the Cushion's two, 2026-10-06, per phase since
+ * 2026-10-07: ten cells), wait 30 days and move at most a quarter of their
+ * admissible range per operation. The ranges are the whitepaper §6.3 bounds;
+ * where a bound is relational (the ladder rungs, D0, unsoldEpochs) the outer
+ * bound is used. The target enforces ranges; this is the second, independent
+ * layer (design N2), so a step here never replaces a check there. The threat
+ * stage itself is bound to one step per operation instead.
+ *
+ * THE VALUATION ORACLE (technical reference §3.3, §3.7; yellow paper §6.1)
+ * ------------------------------------------------------------------------
+ * contracts/staking's `ArkReferenceOracle` holds its own parameters behind the
+ * same `setParamsDiff` payload, so its keys share this table, prefixed `O_`
+ * (the `K_` rows are ArkStakeParams' fields, which the staking repository
+ * mirrors one for one). Fourteen days: the quorum, the round interval, the
+ * heartbeat, the step limit, the dispersion, the deviation alarm and the two
+ * venue lists. Thirty days: `pauseMaxEpochs`, and `arkReferencePrice`, a
+ * value-transfer key whose range has no upper end, so its step is relative:
+ * 2,500 bps of the value replaced (`RELATIVE`). A reporter is added or removed
+ * in seven days, as an attester of the Q-Day oracle is. `pause()` is the
+ * timelock's renewal of a guardian pause in force; the papers state no delay
+ * for it, see `delayOfSelector`.
+ */
+library ArkGovTables {
+    uint64 internal constant H48 = 48 hours;
+    uint64 internal constant D7 = 7 days;
+    uint64 internal constant D14 = 14 days;
+    uint64 internal constant D30 = 30 days;
+
+    /// Marker returned for `setParamsDiff`, whose delay is the maximum over its keys.
+    uint64 internal constant KEYED = type(uint64).max;
+
+    /// Flag on a step: the low bits are bps of the value replaced, not an absolute bound.
+    uint256 internal constant RELATIVE = 1 << 255;
+
+    // Ark Staking targets (contracts/staking).
+    bytes4 internal constant SET_PARAMS_DIFF = bytes4(keccak256("setParamsDiff((bytes32,uint256,uint256)[])"));
+    bytes4 internal constant SET_THREAT_STAGE = bytes4(keccak256("setThreatStage(uint8,uint8)"));
+    bytes4 internal constant PROPOSE_GOVERNANCE = bytes4(keccak256("proposeGovernance(address)"));
+    bytes4 internal constant ACCEPT_GOVERNANCE = bytes4(keccak256("acceptGovernance()"));
+    bytes4 internal constant ADMIT_ASSET =
+        bytes4(keccak256("admitAsset((uint256,address,bytes32,address,uint16,uint16,bool,bool,bool))"));
+    bytes4 internal constant DELIST_ASSET = bytes4(keccak256("delistAsset(bytes32)"));
+    /// The registry's request of an escrow's seed return (re-audit 2026-09-30, ORIGIN-01): with the de-listing, 48 hours.
+    bytes4 internal constant REQUEST_SEED_RETURN = bytes4(keccak256("requestSeedReturn(uint256,address)"));
+    /// Assumed signature: no light-client admission exists in the staking tree yet.
+    bytes4 internal constant ADMIT_LIGHT_CLIENT = bytes4(keccak256("admitLightClient(uint256,address)"));
+    /// Assumed signature: no successor admission exists in the staking tree yet.
+    bytes4 internal constant ADMIT_SUCCESSOR = bytes4(keccak256("admitSuccessor(uint256,bytes32)"));
+    bytes4 internal constant ADMIT_VALIDATOR = bytes4(keccak256("admitValidator(bytes,bytes32,bytes32,address)"));
+    bytes4 internal constant COMMIT_EXIT = bytes4(keccak256("commitExit(bytes32,bytes32)"));
+    bytes4 internal constant WITHDRAW_ADMISSION = bytes4(keccak256("withdrawAdmission(bytes32)"));
+
+    // Governance stack itself (this repository).
+    bytes4 internal constant HAND_OVER = bytes4(keccak256("handOver(address)"));
+    bytes4 internal constant RENOUNCE_GUARDIAN = bytes4(keccak256("renounceGuardian()"));
+    bytes4 internal constant ADD_ATTESTER = bytes4(keccak256("addAttester(address)"));
+    bytes4 internal constant REMOVE_ATTESTER = bytes4(keccak256("removeAttester(address)"));
+    bytes4 internal constant SET_COURT = bytes4(keccak256("setCourt(address)"));
+    bytes4 internal constant SET_OBJECTION_SOURCE = bytes4(keccak256("setObjectionSource(address)"));
+    bytes4 internal constant FORFEIT_DEPOSIT = bytes4(keccak256("forfeitDeposit(uint256,address)"));
+
+    // The valuation oracle (contracts/staking ArkReferenceOracle).
+    bytes4 internal constant ADD_REPORTER = bytes4(keccak256("addReporter(address)"));
+    bytes4 internal constant REMOVE_REPORTER = bytes4(keccak256("removeReporter(address)"));
+    /// The timelock's renewal of a guardian pause in force (yellow paper §6.1); the guardian pauses directly.
+    bytes4 internal constant PAUSE = bytes4(keccak256("pause()"));
+
+    // The ecosystem phase (this repository, ArkPhase; `QuantumArk-Phases.md` §3, 2026-10-07).
+    // `setThreatStage` keeps its row: Ark Staking's in-band 2 <-> 3 step inside Phase 2 (§4).
+    /// 0 <-> 1 <-> 2, one step: 30 days, objectable, as a threat-stage step.
+    bytes4 internal constant SET_PHASE = bytes4(keccak256("setPhase(uint8,uint8)"));
+    /// Stored 0-2 -> 3, defensive only (opens no payout): 48 hours, objectable.
+    bytes4 internal constant ENTER_QDAY = bytes4(keccak256("enterQDay(uint8)"));
+    /// 3 -> 4 Restoration, one-way: 30 days, objectable.
+    bytes4 internal constant RESTORE = bytes4(keccak256("restore(bytes32)"));
+
+    // 7 days.
+    bytes32 internal constant K_RELEASE_BOUND = keccak256("releaseBoundBps");
+    bytes32 internal constant K_EXIT_DEADLINE = keccak256("exitDeadlineEpochs");
+    // The admitted terms per ecosystem phase (2026-10-07; the flat `admittedTermsMask` has no row).
+    bytes32 internal constant K_ADMITTED_TERMS_P0 = keccak256("admittedTermsMask@0");
+    bytes32 internal constant K_ADMITTED_TERMS_P1 = keccak256("admittedTermsMask@1");
+    bytes32 internal constant K_ADMITTED_TERMS_P2 = keccak256("admittedTermsMask@2");
+    bytes32 internal constant K_ADMITTED_TERMS_P3 = keccak256("admittedTermsMask@3");
+    bytes32 internal constant K_ADMITTED_TERMS_P4 = keccak256("admittedTermsMask@4");
+
+    // 30 days, value-transfer keys (design §6.8, YP §4.5): 49 keys, each with a step.
+    // The ladder rungs are here by D5: they reprice exactly as a stage step does.
+    bytes32 internal constant K_STAGE1 = keccak256("threatStage1Bps");
+    bytes32 internal constant K_STAGE2 = keccak256("threatStage2Bps");
+    bytes32 internal constant K_STAGE3 = keccak256("threatStage3Bps");
+    bytes32 internal constant K_STAGE4 = keccak256("threatStage4Bps");
+    bytes32 internal constant K_VERDICT_COVER = keccak256("verdictCoverBps");
+    bytes32 internal constant K_INDEMNITY = keccak256("indemnityBps");
+    bytes32 internal constant K_PML_FLOOR = keccak256("pmlFloorBps");
+    bytes32 internal constant K_JUNIOR_THICKNESS = keccak256("juniorThicknessBps");
+    bytes32 internal constant K_SENIOR_COUPON = keccak256("seniorCouponBps");
+    bytes32 internal constant K_D0 = keccak256("trigger2FloorBps");
+    bytes32 internal constant K_SEVERITY_FLOOR = keccak256("severityFloorBps");
+    // EC-06, 2026-09-30. `premiumSlopeRatioBps` is rho of alpha_t = rho * sigma_t (EC-07).
+    bytes32 internal constant K_PREMIUM_SLOPE_RATIO = keccak256("premiumSlopeRatioBps");
+    bytes32 internal constant K_PREMIUM_CEILING = keccak256("premiumCeilingBps");
+    bytes32 internal constant K_SURGE_CEILING = keccak256("surgeCeilingBps");
+    bytes32 internal constant K_LEVY = keccak256("stabilizationLevyBps");
+    bytes32 internal constant K_COMMITMENT_TERM = keccak256("commitmentTermEpochs");
+    bytes32 internal constant K_PSR_CAP = keccak256("psrCapEpochs");
+    bytes32 internal constant K_TAIL_FLOOR = keccak256("tailPremiumFloorBps");
+    bytes32 internal constant K_MAX_EPOCH_MOVE = keccak256("maxEpochMoveBps");
+    bytes32 internal constant K_FIRST_RESERVE_DISCOUNT = keccak256("firstReserveDiscountBps");
+    bytes32 internal constant K_RESERVE_STEP = keccak256("reserveStepBps");
+    bytes32 internal constant K_RESERVE_FLOOR = keccak256("reserveFloorBps");
+    bytes32 internal constant K_CLEARING_FLOOR = keccak256("clearingFloorBps");
+    bytes32 internal constant K_SOLVER_BOND_CEILING = keccak256("solverBondCeilingBps");
+    bytes32 internal constant K_SOLVER_BOND_FLOOR = keccak256("solverBondFloorBps");
+    bytes32 internal constant K_OPERATIONS = keccak256("operationsBps");
+    bytes32 internal constant K_JUROR_FEE_SHARE = keccak256("jurorFeeShareBps");
+    bytes32 internal constant K_QUEUE_DECAY = keccak256("queueDecayBps");
+    bytes32 internal constant K_QUEUE_EXPOSURE_FLOOR = keccak256("queueExposureFloorBps");
+    bytes32 internal constant K_RUNOFF_TRIGGER = keccak256("runoffTriggerBps");
+    bytes32 internal constant K_RUNOFF_BOUND = keccak256("runoffBoundBps");
+    bytes32 internal constant K_ASSESSMENT_WINDOW = keccak256("assessmentWindowEpochs");
+    bytes32 internal constant K_FX_HAIRCUT_MAX = keccak256("fxHaircutMaxBps");
+    // PV-05 / PV-19, 2026-09-30.
+    bytes32 internal constant K_UNSOLD_EPOCHS = keccak256("unsoldEpochs");
+    bytes32 internal constant K_BUFFER = keccak256("bufferBps");
+    bytes32 internal constant K_BUFFER_ESCALATOR_CAP = keccak256("bufferEscalatorCapBps");
+    bytes32 internal constant K_BUFFER_RAMP_THRESHOLD = keccak256("bufferRampThresholdBps");
+    bytes32 internal constant K_OFFERING_BATCH_MULTIPLE = keccak256("offeringBatchMultiple");
+    bytes32 internal constant K_CLAIM_COST = keccak256("claimCostGwei");
+    // The Cushion, 2026-10-06 (staking technical reference §3.2): its target steers the
+    // Treasury's top-up, its ceiling the thickness credit and so senior issuance. Per
+    // ecosystem phase since 2026-10-07; the flat keys have no row.
+    bytes32 internal constant K_CUSHION_TARGET_P0 = keccak256("cushionTargetBps@0");
+    bytes32 internal constant K_CUSHION_TARGET_P1 = keccak256("cushionTargetBps@1");
+    bytes32 internal constant K_CUSHION_TARGET_P2 = keccak256("cushionTargetBps@2");
+    bytes32 internal constant K_CUSHION_TARGET_P3 = keccak256("cushionTargetBps@3");
+    bytes32 internal constant K_CUSHION_TARGET_P4 = keccak256("cushionTargetBps@4");
+    bytes32 internal constant K_CUSHION_CEILING_P0 = keccak256("cushionCeilingBps@0");
+    bytes32 internal constant K_CUSHION_CEILING_P1 = keccak256("cushionCeilingBps@1");
+    bytes32 internal constant K_CUSHION_CEILING_P2 = keccak256("cushionCeilingBps@2");
+    bytes32 internal constant K_CUSHION_CEILING_P3 = keccak256("cushionCeilingBps@3");
+    bytes32 internal constant K_CUSHION_CEILING_P4 = keccak256("cushionCeilingBps@4");
+
+    // 30 days, no step: not value-transfer keys.
+    bytes32 internal constant K_REWARD_RATE_CAP = keccak256("rewardRateCapBps");
+    bytes32 internal constant K_FX_WINDOW = keccak256("fxWindowDays");
+    bytes32 internal constant K_OPERATOR_BOND = keccak256("operatorBondBps");
+    bytes32 internal constant K_SUCCESSOR_LIMIT = keccak256("successorLimit");
+
+    // 14 days: every other key of whitepaper §6.3.
+    bytes32 internal constant K_MAX_ASSET_SHARE = keccak256("maxAssetShareBps");
+    bytes32 internal constant K_MATURITY_LADDER = keccak256("maturityLadderBps");
+    bytes32 internal constant K_GRACE_EPOCHS = keccak256("graceEpochs");
+    bytes32 internal constant K_VALIDATOR_CONCENTRATION = keccak256("validatorConcentrationBps");
+    bytes32 internal constant K_JUROR_SLASH = keccak256("jurorSlashBps");
+    bytes32 internal constant K_CHALLENGE_WINDOW = keccak256("challengeWindowDays");
+    bytes32 internal constant K_EVIDENCE_WINDOW = keccak256("evidenceDays");
+    bytes32 internal constant K_COMMIT_WINDOW = keccak256("commitDays");
+    bytes32 internal constant K_REVEAL_WINDOW = keccak256("revealDays");
+    bytes32 internal constant K_APPEAL_WINDOW = keccak256("appealDays");
+
+    // The valuation oracle's keys (technical reference §3.7), fields of ArkReferenceOracle.Settings.
+    // 14 days.
+    bytes32 internal constant O_REPORTER_QUORUM = keccak256("reporterQuorum");
+    bytes32 internal constant O_ROUND_INTERVAL = keccak256("roundIntervalSeconds");
+    bytes32 internal constant O_HEARTBEAT = keccak256("heartbeatSeconds");
+    bytes32 internal constant O_MAX_STEP = keccak256("maxStepBps");
+    bytes32 internal constant O_MAX_DISPERSION = keccak256("maxDispersionBps");
+    bytes32 internal constant O_DEVIATION_ALARM = keccak256("deviationAlarmBps");
+    bytes32 internal constant O_VENUE_LIST = keccak256("venueListHash");
+    bytes32 internal constant O_FREEZE_VENUE_LIST = keccak256("freezeVenueListHash");
+    // 30 days: the ARK reference value p_ref (value transfer, relative step) and the pause limit (no step).
+    bytes32 internal constant O_REFERENCE_PRICE = keccak256("arkReferencePrice");
+    bytes32 internal constant O_PAUSE_MAX = keccak256("pauseMaxEpochs");
+
+    /**
+     * Minimum delay of a selector; `KEYED` for the parameter diff; zero when unknown.
+     *
+     * The selector is matched regardless of target. That is sufficient because the
+     * timelock's only power is being `msg.sender`: a call it makes to a contract that
+     * does not name it as governance does nothing a stranger could not do.
+     *
+     * `pause()` waits seven days, a reading of the papers, which state that the
+     * timelock renews a guardian pause in force but give the renewal no row.
+     * The oracle accepts it only while a pause is in force, and a pause lasts
+     * `pauseMaxEpochs` (1 - 4 epochs, two at the reference value): a delay of
+     * thirty or fourteen days would make the renewal unexecutable at the
+     * reference value, and seven days is the reporter replacement it buys time
+     * for. Leg B may object to it at S1 (ArkTimelock `_delayOf`).
+     */
+    function delayOfSelector(bytes4 s) internal pure returns (uint64) {
+        if (s == SET_PARAMS_DIFF) return KEYED;
+        if (
+            s == SET_THREAT_STAGE || s == SET_PHASE || s == RESTORE || s == PROPOSE_GOVERNANCE || s == HAND_OVER
+                || s == RENOUNCE_GUARDIAN || s == SET_COURT || s == SET_OBJECTION_SOURCE
+        ) return D30;
+        if (
+            s == ADMIT_VALIDATOR || s == COMMIT_EXIT || s == WITHDRAW_ADMISSION || s == ADD_ATTESTER || s == REMOVE_ATTESTER
+                || s == ADD_REPORTER || s == REMOVE_REPORTER || s == PAUSE
+        ) return D7;
+        if (
+            s == ADMIT_ASSET || s == DELIST_ASSET || s == ADMIT_LIGHT_CLIENT || s == ADMIT_SUCCESSOR
+                || s == ACCEPT_GOVERNANCE || s == FORFEIT_DEPOSIT || s == REQUEST_SEED_RETURN || s == ENTER_QDAY
+        ) return H48;
+        return 0;
+    }
+
+    /**
+     * Minimum delay of a parameter key and its step limit (zero = no step limit).
+     * A zero delay means the key is unknown and the operation must be refused.
+     *
+     * A non-zero step marks a value-transfer key (design §6.8): the same set the
+     * objection chamber of D6 watches. Every value-transfer key waits 30 days
+     * (EC-06) and moves at most floor((hi - lo) / 4) of its whitepaper §6.3 range
+     * [lo, hi] per operation, the outer bound where a bound is relational; the
+     * rows are the yellow paper §4.5 step table and the model's
+     * `VALUE_TRANSFER_KEYS`, range in each comment.
+     */
+    function ruleOfKey(bytes32 k) internal pure returns (uint64 delay, uint256 step) {
+        if (
+            k == K_RELEASE_BOUND || k == K_EXIT_DEADLINE || k == K_ADMITTED_TERMS_P0 || k == K_ADMITTED_TERMS_P1
+                || k == K_ADMITTED_TERMS_P2 || k == K_ADMITTED_TERMS_P3 || k == K_ADMITTED_TERMS_P4
+        ) return (D7, 0);
+
+        step = _valueTransferStep(k);
+        if (step != 0) return (D30, step);
+
+        if (k == K_REWARD_RATE_CAP || k == K_FX_WINDOW || k == K_OPERATOR_BOND || k == K_SUCCESSOR_LIMIT) {
+            return (D30, 0);
+        }
+        if (
+            k == K_MAX_ASSET_SHARE || k == K_MATURITY_LADDER || k == K_GRACE_EPOCHS || k == K_VALIDATOR_CONCENTRATION
+                || k == K_JUROR_SLASH || k == K_CHALLENGE_WINDOW || k == K_EVIDENCE_WINDOW || k == K_COMMIT_WINDOW
+                || k == K_REVEAL_WINDOW || k == K_APPEAL_WINDOW
+        ) return (D14, 0);
+        return _oracleRule(k);
+    }
+
+    /**
+     * The valuation oracle's keys (technical reference §3.3, §3.7). The step of
+     * `arkReferencePrice` is `RELATIVE | 2,500`: at most 2,500 bps of the value
+     * the operation expects to replace, the papers' bound for a range with no
+     * upper end, which the oracle checks again against the value in force.
+     */
+    function _oracleRule(bytes32 k) private pure returns (uint64, uint256) {
+        if (
+            k == O_REPORTER_QUORUM || k == O_ROUND_INTERVAL || k == O_HEARTBEAT || k == O_MAX_STEP
+                || k == O_MAX_DISPERSION || k == O_DEVIATION_ALARM || k == O_VENUE_LIST || k == O_FREEZE_VENUE_LIST
+        ) return (D14, 0);
+        if (k == O_REFERENCE_PRICE) return (D30, RELATIVE | 2500);
+        if (k == O_PAUSE_MAX) return (D30, 0);
+        return (0, 0);
+    }
+
+    /// The D7 step of a value-transfer key; zero for every other key.
+    function _valueTransferStep(bytes32 k) private pure returns (uint256) {
+        if (k == K_STAGE1 || k == K_STAGE2 || k == K_STAGE3 || k == K_STAGE4) return 537; // 1,850 - 4,000
+        if (k == K_VERDICT_COVER) return 1166; // 3,333 - 8,000
+        if (k == K_INDEMNITY) return 1250; // 5,000 - 10,000
+        if (k == K_PML_FLOOR) return 875; // 1,500 - 5,000
+        if (k == K_JUNIOR_THICKNESS) return 1000; // 5,000 - 9,000
+        if (k == K_SENIOR_COUPON) return 125; // 0 - 500
+        if (k == K_D0) return 1250; // 5,000 - 10,000, and not below S_floor
+        if (k == K_SEVERITY_FLOOR) return 750; // 5,000 - 8,000
+        if (k == K_PREMIUM_SLOPE_RATIO) return 1875; // 2,500 - 10,000
+        if (k == K_PREMIUM_CEILING) return 1912; // 1,850 - 9,500
+        if (k == K_SURGE_CEILING) return 1725; // 1,850 - 8,750
+        if (k == K_LEVY) return 100; // 100 - 500
+        if (k == K_COMMITMENT_TERM) return 5; // 4 - 26 epochs
+        if (k == K_PSR_CAP) return 2; // 2 - 12 epochs
+        if (k == K_TAIL_FLOOR) return 100; // 100 - 500
+        if (k == K_MAX_EPOCH_MOVE) return 375; // 1,500 - 3,000
+        if (k == K_FIRST_RESERVE_DISCOUNT) return 50; // 300 - 500
+        if (k == K_RESERVE_STEP) return 187; // 250 - 1,000
+        if (k == K_RESERVE_FLOOR) return 875; // 2,500 - 6,000
+        if (k == K_CLEARING_FLOOR) return 1250; // 2,500 - 7,500
+        if (k == K_SOLVER_BOND_CEILING) return 250; // 500 - 1,500
+        if (k == K_SOLVER_BOND_FLOOR) return 50; // 100 - 300
+        if (k == K_OPERATIONS) return 187; // 250 - 1,000
+        if (k == K_JUROR_FEE_SHARE) return 1250; // 0 - 5,000
+        if (k == K_QUEUE_DECAY) return 250; // 1,000 - 2,000
+        if (k == K_QUEUE_EXPOSURE_FLOOR) return 750; // 2,000 - 5,000
+        if (k == K_RUNOFF_TRIGGER) return 875; // 1,500 - 5,000
+        if (k == K_RUNOFF_BOUND) return 250; // 1,500 - 2,500
+        if (k == K_ASSESSMENT_WINDOW) return 1; // 2 - 6 epochs
+        if (k == K_FX_HAIRCUT_MAX) return 750; // 0 - 3,000
+        if (k == K_UNSOLD_EPOCHS) return 2; // 2 - 12 epochs, and not below the reserve ladder
+        if (k == K_BUFFER || k == K_BUFFER_ESCALATOR_CAP) return 312; // 250 - 1,500
+        if (k == K_BUFFER_RAMP_THRESHOLD) return 375; // 500 - 2,000, of K
+        if (k == K_OFFERING_BATCH_MULTIPLE) return 25; // 0 - 100, a count
+        if (k == K_CLAIM_COST) return 2500000; // 0 - 10,000,000 gwei
+        // 0 - 2,000, and not above the ceiling of the same phase.
+        if (
+            k == K_CUSHION_TARGET_P0 || k == K_CUSHION_TARGET_P1 || k == K_CUSHION_TARGET_P2 || k == K_CUSHION_TARGET_P3
+                || k == K_CUSHION_TARGET_P4
+        ) return 500;
+        // 0 - 3,000, and not below the target of the same phase.
+        if (
+            k == K_CUSHION_CEILING_P0 || k == K_CUSHION_CEILING_P1 || k == K_CUSHION_CEILING_P2
+                || k == K_CUSHION_CEILING_P3 || k == K_CUSHION_CEILING_P4
+        ) return 750;
+        return 0;
+    }
+}

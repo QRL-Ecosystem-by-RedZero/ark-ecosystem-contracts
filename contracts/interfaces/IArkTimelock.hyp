@@ -1,0 +1,178 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+/**
+ * The timelock that is `governance` of every Ark Staking contract (design §6.1).
+ *
+ * Three roles, each narrower than the last:
+ *   proposer  schedules. The S1 multisig, then ArkGovernor after a one-way
+ *             `handOver`. Cannot choose a delay and cannot execute early.
+ *   anyone    executes a queued operation after its eta, inside a 14-day grace.
+ *   guardian  cancels a Queued operation, and nothing else. Renounced one-way.
+ *
+ * The delay is computed by the timelock from the payload (ArkGovTables), so even
+ * a captured proposer cannot act faster than the table.
+ *
+ * Leg B objection at stage S1 (design §6.8, D6 from S1 by EC-06). An operation
+ * that writes a value-transfer key or moves the threat stage, scheduled before
+ * the first `handOver` (the S1 multisig), is objectable here by bond holders,
+ * weighted by `IObjectionSource.principalAt(holder, queueEpoch)`. At
+ * `OBJECTION_THRESHOLD_BPS` of `totalPrincipalAt(queueEpoch)` it is contested:
+ * it stays Queued, but its eta moves to the close of the objection plus its
+ * delay again, and within that second delay the guardian (or the proposer) may
+ * cancel it. No vote: at S1 there is no governor. From S2 the operations are
+ * queued by ArkGovernor, whose own chamber cancels a contested proposal and
+ * re-votes it once at 15% / 75%; those operations are not objectable here.
+ */
+interface IArkTimelock {
+    enum OpState {
+        None,
+        Queued,
+        Executed,
+        Cancelled,
+        Expired
+    }
+
+    event Scheduled(
+        bytes32 indexed opId, address indexed target, bytes4 indexed selector, uint256 value, uint64 eta, uint64 delay, bytes payload
+    );
+    event Executed(bytes32 indexed opId, address indexed executor);
+    event Cancelled(bytes32 indexed opId, address indexed by);
+    event ProposerHandedOver(address indexed previous, address indexed next);
+    event GuardianRenounced(address indexed previous);
+    event ObjectionSourceSet(address indexed source);
+    event OpObjected(bytes32 indexed opId, address indexed holder, uint256 principal, uint256 totalObjection);
+    /// An S1 operation reached the objection threshold; `eta` is its second delay from now.
+    event OpContested(bytes32 indexed opId, uint64 eta);
+    /// The governor the proposer role may be handed to, named once (re-audit 2026-09-30, SWAPGOV-03).
+    event GovernorSet(address indexed governor);
+
+    error NotProposer(address caller);
+    error NotProposerOrGuardian(address caller);
+    error NotGuardian(address caller);
+    error UnknownSelector(bytes4 selector);
+    error UnknownKey(bytes32 key);
+    error DuplicateKey(bytes32 key);
+    error EmptyDiff();
+    error DiffTooLarge(uint256 length, uint256 maximum);
+    error StepTooLarge(bytes32 key, uint256 expected, uint256 value, uint256 maximumStep);
+    error StageStepInvalid(uint8 fromStage, uint8 toStage);
+    error PayloadTooShort(uint256 length);
+    error OpNotQueued(bytes32 opId, uint8 state);
+    error NotReady(uint64 eta, uint64 currentTime);
+    error ValueMismatch(uint256 required, uint256 supplied);
+    error CallFailed(bytes32 opId, bytes returnData);
+    error SameProposer(address proposer);
+    error ObjectionSourceUnset();
+    error AlreadySet(address current);
+    error OpNotObjectable(bytes32 opId);
+    error OpAlreadyObjected(bytes32 opId, address holder);
+    error NoPrincipal(address holder);
+    /// `handOver` names an account that is not the governor set once (SWAPGOV-03).
+    error NotGovernor(address account);
+    /// A key an operation still Queued names already (SWAPGOV-04, GV-01): one queued operation per key.
+    error KeyPending(bytes32 key, bytes32 opId);
+    /// A `setThreatStage` operation for `target` is still Queued (OC-GOV-02): one queued stage step per target.
+    /// Also a `setPhase` or `restore` while any ecosystem phase step is Queued (2026-10-07).
+    error StagePending(address target);
+    /// The guardian may not cancel the operation that removes it, nor an uncontested handover (GV-03).
+    error GuardianCannotCancel(bytes32 opId);
+    /// The constructor's proposer and guardian are one account (GV-17).
+    error ProposerIsGuardian(address account);
+
+    /// `target` accepted this timelock as its governance through `acceptGovernanceOf` (OC-GOV-03).
+    event GovernanceAccepted(address indexed target, address indexed by);
+
+    function GRACE_PERIOD() external view returns (uint64);
+
+    function OBJECTION_THRESHOLD_BPS() external view returns (uint16);
+
+    function proposer() external view returns (address);
+
+    function guardian() external view returns (address);
+
+    /// Proposer only. The delay is computed, never supplied.
+    function schedule(address target, bytes calldata payload) external returns (bytes32 opId, uint64 eta);
+
+    /// Proposer only. As `schedule`, for a payable target (the operator bond of `admitValidator`).
+    function scheduleWithValue(address target, uint256 value, bytes calldata payload)
+        external
+        returns (bytes32 opId, uint64 eta);
+
+    /// Anyone, after eta and before eta + GRACE_PERIOD. `msg.value` must equal the op's value.
+    function execute(bytes32 opId) external payable returns (bytes memory result);
+
+    /// Proposer or guardian, Queued operations only.
+    function cancel(bytes32 opId) external;
+
+    /**
+     * The timelock itself, through a 30-day operation objectable at S1, and
+     * only to `governor` (re-audit 2026-09-30, SWAPGOV-03). One-way.
+     */
+    function handOver(address newProposer) external;
+
+    /// The governor `handOver` names; zero until set, once, by the proposer.
+    function governor() external view returns (address);
+
+    /// Names the governor. Once, by the proposer.
+    function setGovernor(address governor_) external;
+
+    /// The timelock itself, through a 30-day operation (GV-03: no longer the guardian directly). One-way.
+    function renounceGuardian() external;
+
+    /// Anyone: `target.acceptGovernance()` from this timelock, at once (OC-GOV-03).
+    function acceptGovernanceOf(address target) external;
+
+    /// The table delay of a payload and whether the Leg B chamber watches it (OC-GOV-01).
+    function ruleFor(bytes calldata payload) external view returns (uint64 delay, bool valueTransfer);
+
+    /// Leg B principal (IObjectionSource). Once, by the proposer or through a 30-day self-operation.
+    function setObjectionSource(address source) external;
+
+    function objectionSource() external view returns (address);
+
+    /// True once the S1 proposer has handed over (stage S2 and after).
+    function handedOver() external view returns (bool);
+
+    /// A Leg B holder objects to a Queued S1 value-transfer operation (D6).
+    function object(bytes32 opId) external;
+
+    /// Objection state of an operation: objectable at S1, contested, queue epoch, objection so far.
+    function objectionOf(bytes32 opId)
+        external
+        view
+        returns (bool objectable, bool contested, uint64 queueEpoch, uint256 objection);
+
+    /// The minimum delay the table assigns to this payload. Reverts where the table has no row.
+    function delayFor(bytes calldata payload) external view returns (uint64);
+
+    /// Delay and step limit of a parameter key; zero delay when unknown. A step with bit 255 set
+    /// (`ArkGovTables.RELATIVE`, the oracle's arkReferencePrice) is bps of the value replaced.
+    function keyRule(bytes32 key) external pure returns (uint64 delay, uint256 step);
+
+    /**
+     * True while an operation that steps the threat stage (`setThreatStage`) of
+     * the CALLER is Queued: scheduled, not executed, not cancelled, not expired
+     * (QL-25, PV-20; re-audit 2026-09-30, SWAPGOV-09: counted per target, so a
+     * stage payload aimed at any other account holds nothing). The staking
+     * parameter set asks for itself, and the registry writes it into the
+     * allocation's `stepQueued`. It errs only toward true: a step that expired
+     * while a later one for the same target was queued is counted until the
+     * later one's eta + GRACE_PERIOD.
+     */
+    function stageStepQueued() external view returns (bool);
+
+    /**
+     * `stageStepQueued` for `target`, for any reader. Since 2026-10-07 both
+     * also read true while an ecosystem phase step (`setPhase`, `enterQDay`,
+     * `restore`, any target) is Queued: the phase moves every product's row.
+     */
+    function stageStepQueuedFor(address target) external view returns (bool);
+
+    /// True while an ecosystem phase step (`setPhase`, `enterQDay`, `restore`) is Queued, by the same count rules.
+    function phaseStepQueued() external view returns (bool);
+
+    function stateOf(bytes32 opId) external view returns (OpState);
+
+    function etaOf(bytes32 opId) external view returns (uint64);
+}
