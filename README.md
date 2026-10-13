@@ -31,6 +31,8 @@ unless `ALLOW_PUBLIC_RPC=1` is set.
 | [ArkMultisig.hyp](contracts/ArkMultisig.hyp) | The proposer and guardian multisigs of the early stages |
 | [ArkQDayOracle.hyp](contracts/ArkQDayOracle.hyp) | Q-Day declaration: one bonded attester freezes, a quorum certifies, veARK ratifies |
 | [ArkPhase.hyp](contracts/ArkPhase.hyp) | The ecosystem phase (0-4) every product reads its coefficients by |
+| [ArkEmissionVault.hyp](contracts/ArkEmissionVault.hyp) | The 450M ARK incentive bucket: fixed five-year schedule, Merkle claims per channel and epoch, year-1 claims locked in veARK, the Genesis campaign |
+| [ArkTreasuryRouter.hyp](contracts/ArkTreasuryRouter.hyp) | The Treasury's QRL: operations, Cushion top-up, DAO and liquidity lines, Qurrl's budget |
 | [ChunkedDeployer.hyp](contracts/ChunkedDeployer.hyp) | Deploys creation code too large for one QRL request |
 
 Interfaces a product implements or calls are in [contracts/interfaces](contracts/interfaces):
@@ -58,7 +60,8 @@ and records the profile in each artifact.
 ## Deploying the governance stack
 
 ```bash
-npm run deploy:governance     # multisigs, timelock, token, veARK, rules, oracle, governor
+npm run deploy:governance     # multisigs, timelock, token, veARK, rules, oracle, governor,
+                              # phase, emission vault, treasury router
 npm run governance:keys       # the timelock rows: selectors, keys, delays
 ```
 
