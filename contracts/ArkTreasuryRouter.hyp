@@ -1,0 +1,307 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+
+import "./interfaces/IArkFlow.hyp";
+import "./interfaces/IArkStakeGovernable.hyp";
+import "./utils/ArkFlowReceiver.hyp";
+import "./utils/ArkGovTables.hyp";
+import "./utils/ArkEpoch.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/// Ark Staking's ArkCatBond: how far the Cushion is below its target.
+interface ICushionShortfall {
+    function cushionShortfall() external view returns (uint256);
+}
+
+/// ArkQDayOracle: the protective freeze.
+interface IQDayFreeze {
+    function frozen() external view returns (bool);
+}
+
+/**
+ * ArkTreasuryRouter — the Quantum Ark Treasury's QRL (`QuantumArk-Treasury-Flows.md`
+ * §1-§8, adopted 2026-10-13).
+ *
+ * IN. Three treasury lanes: Qurrl's primary and secondary share, and Ark
+ * Staking's (open, unused until Ark Staking routes to it). The insurance lane
+ * is declared and closed (NFT Insurance is on hold). Inflows land in
+ * `unallocated`.
+ *
+ * REBALANCE (tier 3, then tier 2). Permissionless. The operations line takes
+ * its share first and is never redirected. While the Cushion is below target
+ * (`cushionShortfall()` of the bond), the rest goes to the Cushion pot up to
+ * the shortfall; what remains is split between the DAO and liquidity lines in
+ * their ratio.
+ *
+ * DISPATCH. Permissionless, once per epoch. The Cushion pot goes to the bond
+ * on the `CUSHION` lane, at most `cushionDispatchCapBps` of the router's
+ * balance per epoch; `qurrlDispatchCapBps` of the DAO line goes to Qurrl's
+ * budget on `QURRL_BUDGET`; the operations line is paid to `operations`. The
+ * liquidity line is held until the LP lock exists (ArkAllocation-Design §7.3).
+ * A port that refuses (closed lane, ceiling) keeps its money here. During a
+ * Q-Day freeze only the Cushion is paid, and the inbound lanes close (IArkFlow
+ * rule: only defensive lanes stay open).
+ *
+ * GOVERNED (ArkGovTables, 14 days, a quarter of each range per step): the three
+ * lines (operations 2,000 - 3,500, DAO 4,000 - 6,500, liquidity 1,000 - 2,500,
+ * summing to 10,000) and the two dispatch caps (Qurrl 0 - 2,000, Cushion
+ * 0 - 5,000). `setOperations` is 30 days and objectable.
+ */
+contract ArkTreasuryRouter is ArkFlowReceiver, ReentrancyGuard {
+    uint16 private constant BPS = 10000;
+
+    address public immutable qday;
+    address private immutable _deployer;
+
+    address public governance;
+    address public pendingGovernance;
+    address public operations;
+    /// The bond (CUSHION lane) and Qurrl's budget (QURRL_BUDGET lane), wired once by the deployer.
+    address public cushion;
+    address public qurrlBudget;
+
+    uint16 public operationsLineBps = 2700;
+    uint16 public daoLineBps = 5500;
+    uint16 public liquidityLineBps = 1800;
+    uint16 public qurrlDispatchCapBps = 1000;
+    uint16 public cushionDispatchCapBps = 2500;
+
+    uint256 public unallocated;
+    uint256 public operationsBalance;
+    uint256 public daoBalance;
+    uint256 public liquidityBalance;
+    uint256 public cushionBalance;
+    uint256 public lastDispatchEpoch;
+
+    event Rebalanced(uint256 amount, uint256 toOperations, uint256 toCushion, uint256 toDao, uint256 toLiquidity);
+    event Dispatched(uint256 indexed epoch, uint256 toCushion, uint256 toQurrl, uint256 toOperations);
+    event PortWired(bytes32 indexed lane, address port);
+    event OperationsSet(address operations);
+    event ParamChanged(bytes32 indexed key, uint256 previous, uint256 next);
+    event GovernanceProposed(address indexed next);
+    event GovernanceAccepted(address indexed governance);
+
+    error NotDeployer(address caller);
+    error OnlyGovernance(address caller);
+    error NotPendingGovernance(address caller);
+    error PortAlreadyWired(bytes32 lane);
+    error AlreadyDispatched(uint256 epoch);
+    error NothingToRebalance();
+    error UnknownKey(bytes32 key);
+    error ParamMismatch(bytes32 key, uint256 expected, uint256 current);
+    error ParamOutOfRange(bytes32 key, uint256 value);
+    error LinesNotWhole(uint256 sum);
+
+    constructor(address qday_, address operations_) {
+        if (operations_ == address(0)) revert ZeroAddress();
+        qday = qday_;
+        operations = operations_;
+        governance = msg.sender;
+        _deployer = msg.sender;
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Lanes in                                                            */
+    /* ------------------------------------------------------------------ */
+
+    function _lane(bytes32 lane) internal view override returns (LaneInfo memory info) {
+        if (
+            lane == ArkLanes.TREASURY_QURRL_PRIMARY || lane == ArkLanes.TREASURY_QURRL_SECONDARY
+                || lane == ArkLanes.TREASURY_STAKING
+        ) {
+            info.declared = true;
+            info.open = !frozen();
+            info.room = type(uint256).max;
+        } else if (lane == ArkLanes.TREASURY_INSURANCE) {
+            info.declared = true;
+        }
+    }
+
+    function _onDeposit(bytes32, address, uint256 amount, bytes32) internal override {
+        unallocated += amount;
+    }
+
+    function frozen() public view returns (bool) {
+        if (qday == address(0)) return false;
+        try IQDayFreeze(qday).frozen() returns (bool f) {
+            return f;
+        } catch {
+            return false;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Wiring                                                              */
+    /* ------------------------------------------------------------------ */
+
+    function wireCushion(address cushion_) external {
+        if (msg.sender != _deployer) revert NotDeployer(msg.sender);
+        if (cushion != address(0)) revert PortAlreadyWired(ArkLanes.CUSHION);
+        if (cushion_ == address(0)) revert ZeroAddress();
+        cushion = cushion_;
+        emit PortWired(ArkLanes.CUSHION, cushion_);
+    }
+
+    function wireQurrlBudget(address budget_) external {
+        if (msg.sender != _deployer) revert NotDeployer(msg.sender);
+        if (qurrlBudget != address(0)) revert PortAlreadyWired(ArkLanes.QURRL_BUDGET);
+        if (budget_ == address(0)) revert ZeroAddress();
+        qurrlBudget = budget_;
+        emit PortWired(ArkLanes.QURRL_BUDGET, budget_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Rebalance and dispatch                                              */
+    /* ------------------------------------------------------------------ */
+
+    function rebalance() public {
+        uint256 amount = unallocated;
+        if (amount == 0) revert NothingToRebalance();
+        unallocated = 0;
+
+        uint256 toOps = (amount * operationsLineBps) / BPS;
+        uint256 rest = amount - toOps;
+
+        uint256 toCushion;
+        uint256 shortfall = _shortfall();
+        if (shortfall > cushionBalance) {
+            uint256 gap = shortfall - cushionBalance;
+            toCushion = rest < gap ? rest : gap;
+        }
+        rest -= toCushion;
+
+        uint256 toDao = (rest * daoLineBps) / (uint256(daoLineBps) + liquidityLineBps);
+        uint256 toLiq = rest - toDao;
+
+        operationsBalance += toOps;
+        cushionBalance += toCushion;
+        daoBalance += toDao;
+        liquidityBalance += toLiq;
+        emit Rebalanced(amount, toOps, toCushion, toDao, toLiq);
+    }
+
+    function dispatch() external nonReentrant {
+        uint256 epoch = ArkEpoch.current();
+        if (lastDispatchEpoch == epoch && epoch != 0) revert AlreadyDispatched(epoch);
+        lastDispatchEpoch = epoch;
+        if (unallocated != 0) rebalance();
+
+        bytes32 ref = bytes32(epoch);
+        uint256 total = operationsBalance + daoBalance + liquidityBalance + cushionBalance;
+
+        uint256 sentCushion;
+        if (cushion != address(0) && cushionBalance != 0) {
+            uint256 cap = (total * cushionDispatchCapBps) / BPS;
+            uint256 want = cushionBalance < cap ? cushionBalance : cap;
+            sentCushion = ArkFlowSend.push(cushion, ArkLanes.CUSHION, ref, want);
+            cushionBalance -= sentCushion;
+        }
+
+        uint256 sentQurrl;
+        uint256 sentOps;
+        if (!frozen()) {
+            if (qurrlBudget != address(0) && daoBalance != 0) {
+                uint256 want = (daoBalance * qurrlDispatchCapBps) / BPS;
+                sentQurrl = ArkFlowSend.push(qurrlBudget, ArkLanes.QURRL_BUDGET, ref, want);
+                daoBalance -= sentQurrl;
+            }
+            if (operationsBalance != 0) {
+                uint256 amount = operationsBalance;
+                (bool ok, ) = operations.call{value: amount}("");
+                if (ok) {
+                    operationsBalance = 0;
+                    sentOps = amount;
+                }
+            }
+        }
+        emit Dispatched(epoch, sentCushion, sentQurrl, sentOps);
+    }
+
+    function _shortfall() private view returns (uint256) {
+        if (cushion == address(0)) return 0;
+        try ICushionShortfall(cushion).cushionShortfall() returns (uint256 s) {
+            return s;
+        } catch {
+            return 0;
+        }
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Governance                                                          */
+    /* ------------------------------------------------------------------ */
+
+    function setParamsDiff(IArkStakeGovernable.ParamChange[] calldata changes) external onlyGovernance {
+        bool lines;
+        for (uint256 i = 0; i < changes.length; i++) {
+            bytes32 k = changes[i].key;
+            uint256 v = changes[i].value;
+            uint256 current;
+            if (k == ArkGovTables.T_OPERATIONS_LINE) {
+                current = operationsLineBps;
+                _check(k, v, 2000, 3500);
+                lines = true;
+            } else if (k == ArkGovTables.T_DAO_LINE) {
+                current = daoLineBps;
+                _check(k, v, 4000, 6500);
+                lines = true;
+            } else if (k == ArkGovTables.T_LIQUIDITY_LINE) {
+                current = liquidityLineBps;
+                _check(k, v, 1000, 2500);
+                lines = true;
+            } else if (k == ArkGovTables.T_QURRL_DISPATCH_CAP) {
+                current = qurrlDispatchCapBps;
+                _check(k, v, 0, 2000);
+            } else if (k == ArkGovTables.T_CUSHION_DISPATCH_CAP) {
+                current = cushionDispatchCapBps;
+                _check(k, v, 0, 5000);
+            } else {
+                revert UnknownKey(k);
+            }
+            if (current != changes[i].expected) revert ParamMismatch(k, changes[i].expected, current);
+            _write(k, uint16(v));
+            emit ParamChanged(k, current, v);
+        }
+        if (lines) {
+            uint256 sum = uint256(operationsLineBps) + daoLineBps + liquidityLineBps;
+            if (sum != BPS) revert LinesNotWhole(sum);
+        }
+    }
+
+    function setOperations(address operations_) external onlyGovernance {
+        if (operations_ == address(0)) revert ZeroAddress();
+        operations = operations_;
+        emit OperationsSet(operations_);
+    }
+
+    function proposeGovernance(address next) external onlyGovernance {
+        if (next == address(0)) revert ZeroAddress();
+        pendingGovernance = next;
+        emit GovernanceProposed(next);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance(msg.sender);
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(msg.sender);
+    }
+
+    function _check(bytes32 k, uint256 v, uint256 lo, uint256 hi) private pure {
+        if (v < lo || v > hi) revert ParamOutOfRange(k, v);
+    }
+
+    function _write(bytes32 k, uint16 v) private {
+        if (k == ArkGovTables.T_OPERATIONS_LINE) operationsLineBps = v;
+        else if (k == ArkGovTables.T_DAO_LINE) daoLineBps = v;
+        else if (k == ArkGovTables.T_LIQUIDITY_LINE) liquidityLineBps = v;
+        else if (k == ArkGovTables.T_QURRL_DISPATCH_CAP) qurrlDispatchCapBps = v;
+        else cushionDispatchCapBps = v;
+    }
+}

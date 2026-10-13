@@ -8,6 +8,12 @@
  *   VeArk(ark, protocol-owned incl. the timelock)                  G11
  *   ArkGovernorRules, ArkQDayOracle, ArkGovernor (chunked when large)
  *   VeArk.setGovernor, ArkQDayOracle.setGovernor                    one-shot
+ *   ArkPhase(oracle, timelock, epoch length)                        unless ARK_PHASE names one
+ *   ArkEmissionVault(ark, phase, epoch length, start, publisher)    ArkAllocation-Design §5-§6
+ *   ArkTreasuryRouter(oracle, operations)                           Treasury-Flows §7
+ *   the vault registered as veARK's distributor; the distributor admin, the
+ *   vault and the router handed to the timelock; the incentives bucket moved
+ *   into the vault when the deployer held it
  *
  * and writes deployments/governance-<network>.json. It does NOT hand the
  * timelock to the governor (that is the S1 -> S2 step, `handOver`, a 30-day self-operation since 2026-09-30, taken by the
@@ -60,6 +66,14 @@
  *   GOV_ADMISSION_DEPOSIT          wei of ARK, default 5000 * 10**18
  *   GOV_BUILD_DIR                  artifact directory, default build-qrvm (build-qrvm-testnet under --profile testnet)
  *   GOV_NETWORK                    record name suffix, default the chain id
+ *   ARK_PHASE                      existing ArkPhase; else one is deployed on the timelock
+ *   EMISSION_START_EPOCH           first epoch of the schedule (Ark Staking mainnet; A4),
+ *                                  default the next epoch at the profile's clock
+ *   EMISSION_ROOT_PUBLISHER        default SEALER_ADDRESS, else the deployer
+ *   TREASURY_OPERATIONS            the operations line's payee, default the proposer multisig
+ *
+ * Left to the proposer multisig (the deployer holds no key there):
+ * ArkTimelock.setArkToken(ArkToken), which opens the treasury's `transfer` row.
  */
 const fs = require('fs');
 const path = require('path');
@@ -112,8 +126,13 @@ function config(env, deployer) {
     qdayQuorumBps: num(env.GOV_QDAY_QUORUM_BPS, 500),
     objectionThresholdBps: num(env.GOV_OBJECTION_THRESHOLD_BPS, 2000),
     admissionDeposit: big(env.GOV_ADMISSION_DEPOSIT, 5000n * 10n ** 18n),
+    arkPhase: env.ARK_PHASE || '',
+    epochLength: 7 * PROFILE.day,
+    emissionStart: env.EMISSION_START_EPOCH === undefined || env.EMISSION_START_EPOCH === '' ? null : BigInt(env.EMISSION_START_EPOCH),
+    rootPublisher: env.EMISSION_ROOT_PUBLISHER || env.SEALER_ADDRESS || '',
+    operations: env.TREASURY_OPERATIONS || '',
   };
-  for (const k of ['ARK_TREASURY', 'ARK_BACKSTOP', 'ARK_INCENTIVES']) {
+  for (const k of ['ARK_TREASURY', 'ARK_BACKSTOP', 'ARK_INCENTIVES', 'ARK_LIQUIDITY']) {
     if (env[k] && !c.protocolOwned.some((a) => same(a, env[k]))) c.protocolOwned.push(env[k]);
   }
 
@@ -138,7 +157,7 @@ function config(env, deployer) {
 }
 
 function describeArtifacts(buildDir) {
-  const names = ['ChunkedDeployer', 'ArkMultisig', 'ArkTimelock', 'ArkToken', 'VeArk', 'ArkGovernorRules', 'ArkQDayOracle', 'ArkGovernor'];
+  const names = ['ChunkedDeployer', 'ArkMultisig', 'ArkTimelock', 'ArkToken', 'VeArk', 'ArkGovernorRules', 'ArkQDayOracle', 'ArkGovernor', 'ArkPhase', 'ArkEmissionVault', 'ArkTreasuryRouter'];
   const out = {};
   for (const n of names) {
     const art = qrl.artifact(n, buildDir);
@@ -200,11 +219,19 @@ async function main() {
   d.GuardianMultisig = await put('ArkMultisig', [c.guardianOwners, c.guardianThreshold]);
   d.ArkTimelock = await put('ArkTimelock', [d.ProposerMultisig, d.GuardianMultisig]);
   const buckets = defaultBuckets(c.buckets, me, d.ArkTimelock);
-  d.ArkToken = c.ark || (await put('ArkToken', [...buckets, Math.floor(Date.now() / 1000)]));
-  const protocolOwned = [...c.protocolOwned, d.ArkTimelock];
+  // Delta 7 (ArkAllocation-Design §10): vesting starts with the emission schedule.
+  const startEpoch = c.emissionStart ?? BigInt(Math.floor(Date.now() / 1000 / c.epochLength) + 1);
+  const start = Number(startEpoch) * c.epochLength;
+  d.ArkToken = c.ark || (await put('ArkToken', [...buckets, start]));
+  d.ArkQDayOracle = await put('ArkQDayOracle', [d.ArkTimelock, c.court, c.attesterBond, c.advisoryCooldown, c.attesters]);
+  d.ArkPhase = c.arkPhase || (await put('ArkPhase', [d.ArkQDayOracle, d.ArkTimelock, c.epochLength]));
+  d.ArkEmissionVault = await put('ArkEmissionVault', [d.ArkToken, d.ArkPhase, c.epochLength, startEpoch, c.rootPublisher || me]);
+  d.ArkTreasuryRouter = await put('ArkTreasuryRouter', [d.ArkQDayOracle, c.operations || d.ProposerMultisig]);
+  // AL2: the vault, the treasury, the reserve, unlocked liquidity and the timelock never vote.
+  const protocolOwned = [...c.protocolOwned, d.ArkTimelock, d.ArkEmissionVault];
+  if (!c.ark) for (const b of buckets.slice(1)) if (!protocolOwned.some((a) => same(a, b))) protocolOwned.push(b);
   d.VeArk = await put('VeArk', [d.ArkToken, protocolOwned]);
   d.ArkGovernorRules = await put('ArkGovernorRules', []);
-  d.ArkQDayOracle = await put('ArkQDayOracle', [d.ArkTimelock, c.court, c.attesterBond, c.advisoryCooldown, c.attesters]);
   d.ArkGovernor = await put(
     'ArkGovernor',
     [
@@ -223,6 +250,20 @@ async function main() {
 
   await send(d.VeArk, art('VeArk').abi, 'setGovernor', [d.ArkGovernor]);
   await send(d.ArkQDayOracle, art('ArkQDayOracle').abi, 'setGovernor', [d.ArkGovernor]);
+
+  // The emission vault locks through veARK; the timelock adds any later distributor (30 days).
+  await send(d.VeArk, art('VeArk').abi, 'addDistributor', [d.ArkEmissionVault]);
+  await send(d.VeArk, art('VeArk').abi, 'setDistributorAdmin', [d.ArkTimelock]);
+  await send(d.ArkEmissionVault, art('ArkEmissionVault').abi, 'setVeArk', [d.VeArk]);
+  // The incentives bucket the deployer held by default belongs in the vault.
+  const tokenAbi = art('ArkToken').abi;
+  const held = BigInt(await new web3.qrl.Contract(tokenAbi, d.ArkToken).methods.balanceOf(me).call());
+  if (!c.ark && same(buckets[0], me) && held > 0n) await send(d.ArkToken, tokenAbi, 'transfer', [d.ArkEmissionVault, held]);
+  // Governance of the vault and the router moves to the timelock at once (OC-GOV-03).
+  for (const [name, addr] of [['ArkEmissionVault', d.ArkEmissionVault], ['ArkTreasuryRouter', d.ArkTreasuryRouter]]) {
+    await send(addr, art(name).abi, 'proposeGovernance', [d.ArkTimelock]);
+    await send(d.ArkTimelock, art('ArkTimelock').abi, 'acceptGovernanceOf', [addr]);
+  }
 
   // Read back what the stage rests on, rather than trusting the sends.
   const view = (addr, name, method, args = []) => new web3.qrl.Contract(art(name).abi, addr).methods[method](...args).call();
@@ -259,12 +300,19 @@ async function main() {
       qdayQuorumBps: c.qdayQuorumBps,
       objectionThresholdBps: c.objectionThresholdBps,
       admissionDeposit: String(c.admissionDeposit),
+      epochLength: c.epochLength,
+      emissionStartEpoch: String(startEpoch),
+      emissionStart: start,
+      rootPublisher: c.rootPublisher || me,
+      operations: c.operations || d.ProposerMultisig,
       uncalibrated: ['proposalThresholdBps', 'qdayQuorumBps', 'objectionThresholdBps', 'attesterBond', 'advisoryCooldown'],
     },
     next: [
       'each Ark Staking contract: governance.proposeGovernance(ArkTimelock)',
       'proposer multisig: timelock.schedule(<staking contract>, acceptGovernance()) then execute after 48 h',
       'attesters: ArkQDayOracle.postBond() with at least attesterBond',
+      'proposer multisig: ArkTimelock.setArkToken(ArkToken), which opens the treasury transfer row (ArkAllocation-Design §7.1)',
+      'deployer: ArkTreasuryRouter.wireCushion(ArkCatBond) and wireQurrlBudget(QurrlBudget), once each, when those exist',
       'S1 -> S2 (design §7): proposer multisig calls ArkTimelock.setGovernor(ArkGovernor), then schedules the self-operation ArkTimelock.handOver(ArkGovernor) (30 days, objectable at S1; re-audit 2026-09-30, SWAPGOV-03)',
     ],
   };

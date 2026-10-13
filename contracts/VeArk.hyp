@@ -182,6 +182,12 @@ contract VeArk is IVeArk, ReentrancyGuard {
     /// Remainder of the last index division, carried into the next distribution.
     uint256 private _dust;
 
+    /// Contracts allowed to lock for others (the emission vault). Private: OC-V3-02.
+    mapping(address => bool) private _distributors;
+
+    /// Registers distributors: the deployer, then the timelock (30-day objectable row).
+    address public distributorAdmin;
+
     /// An amount does not fit the packed totals. Unreachable with ARK's fixed supply.
     error AmountTooLarge(uint256 amount);
 
@@ -195,6 +201,7 @@ contract VeArk is IVeArk, ReentrancyGuard {
         if (ark_ == address(0)) revert ZeroAddress();
         ark = IERC20(ark_);
         _deployer = msg.sender;
+        distributorAdmin = msg.sender;
         for (uint256 i = 0; i < protocolOwned.length; i++) {
             if (protocolOwned[i] == address(0)) revert ZeroAddress();
             _protocolOwned[protocolOwned[i]] = true;
@@ -214,6 +221,26 @@ contract VeArk is IVeArk, ReentrancyGuard {
         if (governor_ == address(0)) revert ZeroAddress();
         governor = governor_;
         emit GovernorSet(governor_);
+    }
+
+    // ----------------------------------------------------------- distributors
+
+    function addDistributor(address distributor) external {
+        if (msg.sender != distributorAdmin) revert NotDistributorAdmin(msg.sender);
+        if (distributor == address(0)) revert ZeroAddress();
+        _distributors[distributor] = true;
+        emit DistributorAdded(distributor);
+    }
+
+    function setDistributorAdmin(address newAdmin) external {
+        if (msg.sender != distributorAdmin) revert NotDistributorAdmin(msg.sender);
+        if (newAdmin == address(0)) revert ZeroAddress();
+        emit DistributorAdminChanged(distributorAdmin, newAdmin);
+        distributorAdmin = newAdmin;
+    }
+
+    function isDistributor(address account) external view returns (bool) {
+        return _distributors[account];
     }
 
     // ------------------------------------------------------------------ locks
@@ -293,6 +320,57 @@ contract VeArk is IVeArk, ReentrancyGuard {
         _resync(msg.sender);
 
         emit LockExtended(msg.sender, previous, end);
+    }
+
+    /**
+     * Locks ARK for `account`, paid by a registered distributor.
+     *
+     * @dev Mirrors createLock / extendLock / increaseAmount in that order, on
+     *      the account's lock rather than the caller's. The duration check runs
+     *      on the requested end only when it lengthens the lock: an account
+     *      already locked longer keeps its end, so a year-1 claim against a lock
+     *      at MAX_LOCK simply adds to it.
+     */
+    function lockFor(address account, uint256 amount, uint64 unlockTime) external nonReentrant {
+        if (!_distributors[msg.sender]) revert NotDistributor(msg.sender);
+        if (amount == 0) revert ZeroValue();
+        if (account == address(0)) revert ZeroAddress();
+        if (_protocolOwned[account]) revert ProtocolOwned(account);
+
+        uint64 nowTs = uint64(block.timestamp);
+        uint64 end = _roundDown(unlockTime);
+        Lock storage lock = _locks[account];
+
+        if (lock.amount == 0) {
+            _checkDuration(nowTs, end);
+            _locks[account] = Lock({amount: amount, start: nowTs, end: end});
+            _delegatee[account] = account;
+            _enter(GLOBAL, amount, end);
+            _enter(account, amount, end);
+        } else {
+            _settle(account);
+            address d = _delegatee[account];
+            if (end > lock.end) {
+                _checkDuration(nowTs, end);
+                _leave(GLOBAL, lock.amount, lock.end);
+                _enter(GLOBAL, lock.amount, end);
+                _leave(d, lock.amount, lock.end);
+                _enter(d, lock.amount, end);
+                emit LockExtended(account, lock.end, end);
+                lock.end = end;
+            }
+            lock.amount += amount;
+            _enter(GLOBAL, amount, lock.end);
+            _enter(d, amount, lock.end);
+        }
+        _record(account);
+        _resync(account);
+
+        if (!ark.transferFrom(msg.sender, address(this), amount)) {
+            revert TransferFailed(address(this), amount);
+        }
+
+        emit LockedFor(msg.sender, account, amount, lock.end);
     }
 
     /**

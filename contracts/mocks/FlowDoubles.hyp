@@ -59,3 +59,32 @@ contract NotAReceiver {
         revert("no");
     }
 }
+
+/// Test-only. A port for the treasury router: CUSHION or QURRL_BUDGET, with a settable shortfall.
+contract PortDouble is ArkFlowReceiver {
+    bytes32 public immutable lane;
+    uint256 public shortfall;
+    bool public closed;
+
+    constructor(bytes32 lane_) {
+        lane = lane_;
+    }
+
+    function setShortfall(uint256 v) external {
+        shortfall = v;
+    }
+
+    function setClosed(bool v) external {
+        closed = v;
+    }
+
+    function cushionShortfall() external view returns (uint256) {
+        return shortfall;
+    }
+
+    function _lane(bytes32 l) internal view override returns (LaneInfo memory info) {
+        if (l == lane) {
+            info = LaneInfo({declared: true, open: !closed, oneWay: l == ArkLanes.CUSHION, defensive: l == ArkLanes.CUSHION, room: type(uint256).max});
+        }
+    }
+}

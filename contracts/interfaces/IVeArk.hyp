@@ -111,6 +111,21 @@ interface IVeArk {
     /// Only the governor may pin voters.
     error NotGovernor(address caller);
 
+    /// A distributor locked ARK for an account (created, topped up or extended).
+    event LockedFor(address indexed distributor, address indexed account, uint256 amount, uint64 unlockTime);
+
+    /// A distributor was registered. Registration is permanent.
+    event DistributorAdded(address indexed distributor);
+
+    /// The address allowed to register distributors changed.
+    event DistributorAdminChanged(address indexed previousAdmin, address indexed newAdmin);
+
+    /// Only a registered distributor may lock for another account.
+    error NotDistributor(address caller);
+
+    /// Only the distributor admin may register distributors or hand the role over.
+    error NotDistributorAdmin(address caller);
+
     /// Shortest permitted lock.
     function MIN_LOCK() external view returns (uint64);
 
@@ -141,6 +156,31 @@ interface IVeArk {
 
     /// @notice Withdraws a matured lock in full, once no vote pin holds it. Partial early exit does not exist.
     function withdraw() external;
+
+    /**
+     * Locks ARK on behalf of `account`, paid by the calling distributor.
+     *
+     * @dev One call covers the three cases: no lock (created, delegated to the
+     *      account), a lock ending earlier than `unlockTime` (extended, re-arming
+     *      an expired one), and a lock ending at or after it (kept). The amount is
+     *      then added at the resulting end, so a lock is never shortened. G11
+     *      applies to `account`, not to the distributor, which is usually a
+     *      protocol-owned vault (ArkAllocation-Design §6, delta 3).
+     * @param account Owner of the lock; never a protocol-owned address.
+     * @param amount ARK to add; transferred from the caller.
+     * @param unlockTime Requested maturity, rounded down to an epoch boundary.
+     */
+    function lockFor(address account, uint256 amount, uint64 unlockTime) external;
+
+    /// @notice Registers a distributor. Distributor admin only (the timelock after handover).
+    function addDistributor(address distributor) external;
+
+    /// @notice Hands the distributor admin role to `newAdmin` (the timelock). Current admin only.
+    function setDistributorAdmin(address newAdmin) external;
+
+    function isDistributor(address account) external view returns (bool);
+
+    function distributorAdmin() external view returns (address);
 
     /**
      * Moves the caller's lock weight to `to`. `to == msg.sender` takes it back.
@@ -253,6 +293,9 @@ interface IVeArk {
      * @return Total veARK weight at that snapshot.
      */
     function totalWeightAt(uint256 blockNumber) external view returns (uint256);
+
+    /// @return Exact total veARK weight right now (the live form of `totalWeightAt`).
+    function totalWeight() external view returns (uint256);
 
     event DividendDistributed(uint256 amount, uint256 accQrlPerUnit, uint256 totalUnits);
     event DividendClaimed(address indexed account, uint256 amount);

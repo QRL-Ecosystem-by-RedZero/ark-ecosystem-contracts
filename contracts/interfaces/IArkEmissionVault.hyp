@@ -1,0 +1,129 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./IArkStakeGovernable.hyp";
+
+/**
+ * The ARK emission vault: the community-incentive bucket (450M ARK) and the
+ * only way ARK leaves it (`ArkAllocation-Design.md` §5, §6, A2-A4, A7-A12).
+ *
+ * FOUR CHANNELS PER EPOCH (§5.2)
+ * ------------------------------
+ * 0 Ark Staking, 1 Acorn, 2 governance and security, 3 locked liquidity. Each
+ * closed epoch gets one Merkle root per channel, written once by the root
+ * publisher, with leaves `keccak256(abi.encodePacked(account, channel, amount))`.
+ * The total a root may pay is at most that epoch's budget: the year's amount
+ * (35/25/18/12/10 of the vault, year 1 net of the Genesis campaign) over 52
+ * epochs, times the channel's share in the phase in force at the epoch.
+ *
+ * HOW ARK IS RECEIVED (§6)
+ * ------------------------
+ * In the first year after `start`, every channel claim is a four-year veARK
+ * lock (`VeArk.lockFor`). From year 2 the claimant chooses: a four-year lock
+ * of the full amount, or amount / 2.5 liquid; the difference stays here.
+ *
+ * THE GENESIS CAMPAIGN (§6.4, A7-A12)
+ * -----------------------------------
+ * 25M ARK outside the four channels, three roots written once: `campaign`
+ * (channel 4), `reserve` (channel 5, published later) and `ambassadors`
+ * (channel 6, vested over 52 epochs after a 13-epoch cliff). A campaign or
+ * reserve claim locks the full amount for at least a year, or pays 2/3 liquid.
+ * Campaign claims are open for 120 days from `start` (scaled by the epoch
+ * length on a testnet profile), reserve claims for twice that.
+ */
+interface IArkEmissionVault {
+    event RootSet(uint256 indexed epoch, uint8 indexed channel, bytes32 root, uint256 total);
+    event Claimed(address indexed account, uint256 indexed epoch, uint8 indexed channel, uint256 amount, uint256 paid, bool locked);
+    event CampaignRootSet(uint8 indexed channel, bytes32 root);
+    event CampaignClaimed(address indexed account, uint8 indexed channel, uint256 entitlement, uint256 paid, bool locked);
+    event VestedClaimed(address indexed account, uint256 total, uint256 paid);
+    event ShareChanged(bytes32 indexed key, uint256 previous, uint256 next);
+    event RootPublisherSet(address publisher);
+    event VeArkSet(address veArk);
+    event GovernanceProposed(address indexed next);
+    event GovernanceAccepted(address indexed governance);
+
+    error NotDeployer(address caller);
+    error NotPublisher(address caller);
+    error OnlyGovernance(address caller);
+    error NotPendingGovernance(address caller);
+    error VeArkAlreadySet();
+    error EpochLengthZero();
+    error UnknownChannel(uint8 channel);
+    error EpochNotClosed(uint256 epoch);
+    error EpochOutOfSchedule(uint256 epoch);
+    error RootAlreadySet(uint256 epoch, uint8 channel);
+    error RootUnset(uint256 epoch, uint8 channel);
+    error RootOverBudget(uint256 total, uint256 budget);
+    error InvalidProof();
+    error AlreadyClaimed(address account);
+    error RootExhausted(uint256 claimed, uint256 amount, uint256 total);
+    error CampaignClosed(uint64 opens, uint64 closes, uint64 nowTs);
+    error CampaignPoolExceeded(uint256 spent, uint256 amount, uint256 pool);
+    error CampaignLockTooShort(uint64 unlockTime, uint64 minimum);
+    error NothingVested(address account);
+    error UnknownShareKey(bytes32 key);
+    error ShareMismatch(bytes32 key, uint256 expected, uint256 current);
+    error ShareOutOfRange(bytes32 key, uint256 value);
+    error SharesNotWhole(uint8 phase, uint256 sum);
+
+    // Channels.
+    function STAKING() external view returns (uint8);
+    function ACORN() external view returns (uint8);
+    function GOVERNANCE() external view returns (uint8);
+    function LIQUIDITY() external view returns (uint8);
+    function CAMPAIGN() external view returns (uint8);
+    function RESERVE() external view returns (uint8);
+    function AMBASSADORS() external view returns (uint8);
+
+    /// First epoch of the schedule (Ark Staking mainnet); `start` is its opening boundary.
+    function startEpoch() external view returns (uint256);
+    function start() external view returns (uint64);
+    function epochLength() external view returns (uint256);
+    function currentEpoch() external view returns (uint256);
+
+    /// ARK the four channels may pay for `epoch` in total (zero outside the five years).
+    function epochAmount(uint256 epoch) external view returns (uint256);
+    /// What one channel's root for `epoch` may pay at most.
+    function budgetOf(uint256 epoch, uint8 channel) external view returns (uint256);
+    /// A channel's share in `phase`, bps.
+    function shareOf(uint8 phase, uint8 channel) external view returns (uint16);
+
+    function setRoot(uint256 epoch, uint8 channel, bytes32 root, uint256 total) external;
+    function rootOf(uint256 epoch, uint8 channel) external view returns (bytes32 root, uint256 total, uint256 claimed);
+    function hasClaimed(uint256 epoch, uint8 channel, address account) external view returns (bool);
+
+    /**
+     * Claims a channel leaf. Year 1 ignores `lock` and locks for four years;
+     * from year 2, `lock` false pays amount * 2 / 5 liquid.
+     */
+    function claim(uint256 epoch, uint8 channel, uint256 amount, bytes32[] calldata proof, bool lock) external;
+
+    function setCampaignRoot(uint8 channel, bytes32 root) external;
+    function campaignRootOf(uint8 channel) external view returns (bytes32);
+    /// [opens, closes] of a campaign channel (CAMPAIGN or RESERVE).
+    function campaignWindow(uint8 channel) external view returns (uint64 opens, uint64 closes);
+    /// Entitlement counted against the 25M pool so far (campaign, reserve and vested ambassador ARK).
+    function campaignSpent() external view returns (uint256);
+
+    /**
+     * Claims a campaign or reserve leaf. `unlockTime` zero pays amount * 2 / 3
+     * liquid; otherwise it must be at least a year away and the full amount is
+     * locked until it.
+     */
+    function claimCampaign(uint8 channel, uint256 amount, bytes32[] calldata proof, uint64 unlockTime) external;
+
+    /// Pays the vested part of an ambassador leaf not yet paid. Liquid.
+    function claimVested(uint256 total, bytes32[] calldata proof) external;
+    function vestedOf(uint256 total) external view returns (uint256);
+    function releasedTo(address account) external view returns (uint256);
+
+    /// The four channel shares per phase, keyed emission<Channel>, an at sign and the phase; compare-and-swap, each phase sums to 10,000.
+    function setParamsDiff(IArkStakeGovernable.ParamChange[] calldata changes) external;
+
+    function rootPublisher() external view returns (address);
+    function setRootPublisher(address publisher) external;
+    function governance() external view returns (address);
+    function proposeGovernance(address next) external;
+    function acceptGovernance() external;
+}

@@ -63,6 +63,28 @@ pragma hyperion >=0.0.1;
  * in seven days, as an attester of the Q-Day oracle is. `pause()` is the
  * timelock's renewal of a guardian pause in force; the papers state no delay
  * for it, see `delayOfSelector`.
+ *
+ * ARK ALLOCATION, TREASURY AND QURRL (2026-10-13)
+ * -----------------------------------------------
+ * `ArkAllocation-Design.md` §5-§7 and `QuantumArk-Treasury-Flows.md` §3, §7:
+ *   - `ArkEmissionVault`: the four channel shares per phase,
+ *     emission{Staking,Acorn,Governance,Liquidity}, an at sign and p (30 days, value
+ *     transfer, step 2,500 = a quarter of 0 - 10,000); `setRootPublisher` in 7 days.
+ *   - `VeArk.addDistributor`: 30 days, objectable (a distributor locks ARK for others).
+ *   - The treasury's ARK: `transfer(address,uint256)` in 30 days, objectable;
+ *     the timelock accepts it only on the ARK token and within
+ *     `arkSpendCapBps` of supply per quarter (ArkTimelock). That cap is the
+ *     timelock's own key (30 days, step 50 = a quarter of 0 - 200).
+ *   - `ArkTreasuryRouter`: its three lines and two dispatch caps, 14 days
+ *     with a step of a quarter of each range (Treasury-Flows §3, tier 2: the
+ *     router moves QRL between the treasury's own lines, not a position, so
+ *     the 30-day rule of the staking value-transfer keys is not applied);
+ *     `setOperations` 30 days, objectable.
+ *   - Qurrl (`QurrlPhaseMinter`, `QurrlRevenueSplitter`, the collection's
+ *     admin role): every per-phase key (field, at sign, phase) of the minter in 14 days, computed
+ *     rather than listed (`_qurrlRule`); `setCushionBps` 30 days with the
+ *     splitter's own 7.5-point step; the one-shot wiring and the role
+ *     transfers 30 days, objectable; the rest 14 or 7 days.
  */
 library ArkGovTables {
     uint64 internal constant H48 = 48 hours;
@@ -117,6 +139,31 @@ library ArkGovTables {
     bytes4 internal constant ENTER_QDAY = bytes4(keccak256("enterQDay(uint8)"));
     /// 3 -> 4 Restoration, one-way: 30 days, objectable.
     bytes4 internal constant RESTORE = bytes4(keccak256("restore(bytes32)"));
+
+    // ARK allocation (2026-10-13, ArkAllocation-Design §5.3, §7.1, delta 3).
+    bytes4 internal constant SET_ROOT_PUBLISHER = bytes4(keccak256("setRootPublisher(address)"));
+    bytes4 internal constant ADD_DISTRIBUTOR = bytes4(keccak256("addDistributor(address)"));
+    /// The treasury's ARK: only on the ARK token, within the quarterly cap (ArkTimelock).
+    bytes4 internal constant TRANSFER = bytes4(keccak256("transfer(address,uint256)"));
+
+    // The treasury router and Qurrl's budget (QuantumArk-Treasury-Flows.md §7, adopted 2026-10-13).
+    bytes4 internal constant SET_OPERATIONS = bytes4(keccak256("setOperations(address)"));
+    bytes4 internal constant PAY_BUDGET = bytes4(keccak256("payBudget(address,uint256)"));
+
+    // Qurrl (contracts/qurrl): the splitter, the minter and the collection's admin role.
+    bytes4 internal constant SET_CUSHION_BPS = bytes4(keccak256("setCushionBps(uint16)"));
+    bytes4 internal constant SET_TREASURY = bytes4(keccak256("setTreasury(address)"));
+    bytes4 internal constant SET_CUSHION = bytes4(keccak256("setCushion(address)"));
+    bytes4 internal constant SET_OWNER = bytes4(keccak256("setOwner(address)"));
+    bytes4 internal constant SET_ACORN_ORACLE = bytes4(keccak256("setAcornOracle(address)"));
+    bytes4 internal constant SET_ACORN_SOURCE = bytes4(keccak256("setAcornSource(address)"));
+    bytes4 internal constant SET_ROYALTY = bytes4(keccak256("setRoyalty(address,uint16)"));
+    bytes4 internal constant SET_RENDERER = bytes4(keccak256("setRenderer(address)"));
+    bytes4 internal constant SET_URIS = bytes4(keccak256("setURIs(string,string)"));
+    bytes4 internal constant FREEZE = bytes4(keccak256("freeze()"));
+    bytes4 internal constant SEAL_PALETTE = bytes4(keccak256("sealPalette()"));
+    bytes4 internal constant GRANT_ROLE = bytes4(keccak256("grantRole(bytes32,address)"));
+    bytes4 internal constant REVOKE_ROLE = bytes4(keccak256("revokeRole(bytes32,address)"));
 
     // 7 days.
     bytes32 internal constant K_RELEASE_BOUND = keccak256("releaseBoundBps");
@@ -217,6 +264,15 @@ library ArkGovTables {
     bytes32 internal constant O_REFERENCE_PRICE = keccak256("arkReferencePrice");
     bytes32 internal constant O_PAUSE_MAX = keccak256("pauseMaxEpochs");
 
+    // The timelock's own key: the treasury's ARK spend per quarter, bps of supply (30 days).
+    bytes32 internal constant T_ARK_SPEND_CAP = keccak256("arkSpendCapBps");
+    // ArkTreasuryRouter (14 days, value transfer).
+    bytes32 internal constant T_OPERATIONS_LINE = keccak256("operationsLineBps");
+    bytes32 internal constant T_DAO_LINE = keccak256("daoLineBps");
+    bytes32 internal constant T_LIQUIDITY_LINE = keccak256("liquidityLineBps");
+    bytes32 internal constant T_QURRL_DISPATCH_CAP = keccak256("qurrlDispatchCapBps");
+    bytes32 internal constant T_CUSHION_DISPATCH_CAP = keccak256("cushionDispatchCapBps");
+
     /**
      * Minimum delay of a selector; `KEYED` for the parameter diff; zero when unknown.
      *
@@ -238,6 +294,12 @@ library ArkGovTables {
             s == SET_THREAT_STAGE || s == SET_PHASE || s == RESTORE || s == PROPOSE_GOVERNANCE || s == HAND_OVER
                 || s == RENOUNCE_GUARDIAN || s == SET_COURT || s == SET_OBJECTION_SOURCE
         ) return D30;
+        if ((isObjectableAllocation(s) && s != PAY_BUDGET) || s == SET_CUSHION_BPS) return D30;
+        if (
+            s == PAY_BUDGET || s == SET_OWNER || s == SET_ACORN_ORACLE || s == SET_ACORN_SOURCE || s == SET_RENDERER
+                || s == SET_URIS
+        ) return D14;
+        if (s == SET_ROOT_PUBLISHER || s == FREEZE || s == SEAL_PALETTE) return D7;
         if (
             s == ADMIT_VALIDATOR || s == COMMIT_EXIT || s == WITHDRAW_ADMISSION || s == ADD_ATTESTER || s == REMOVE_ATTESTER
                 || s == ADD_REPORTER || s == REMOVE_REPORTER || s == PAUSE
@@ -247,6 +309,16 @@ library ArkGovTables {
                 || s == ACCEPT_GOVERNANCE || s == FORFEIT_DEPOSIT || s == REQUEST_SEED_RETURN || s == ENTER_QDAY
         ) return H48;
         return 0;
+    }
+
+    /**
+     * The 2026-10-13 selectors the Leg B chamber watches at S1 (ArkTimelock
+     * `_delayOf`): what moves ARK or QRL out of a protocol account, adds a
+     * distributor, wires a revenue destination once, or hands a role over.
+     */
+    function isObjectableAllocation(bytes4 s) internal pure returns (bool) {
+        return s == TRANSFER || s == ADD_DISTRIBUTOR || s == SET_OPERATIONS || s == PAY_BUDGET || s == SET_TREASURY
+            || s == SET_CUSHION || s == SET_ROYALTY || s == GRANT_ROLE || s == REVOKE_ROLE || s == SET_CUSHION_BPS;
     }
 
     /**
@@ -277,7 +349,58 @@ library ArkGovTables {
                 || k == K_JUROR_SLASH || k == K_CHALLENGE_WINDOW || k == K_EVIDENCE_WINDOW || k == K_COMMIT_WINDOW
                 || k == K_REVEAL_WINDOW || k == K_APPEAL_WINDOW
         ) return (D14, 0);
-        return _oracleRule(k);
+        (delay, step) = _oracleRule(k);
+        if (delay != 0) return (delay, step);
+        (delay, step) = _allocationRule(k);
+        if (delay != 0) return (delay, step);
+        return _qurrlRule(k);
+    }
+
+    /**
+     * The emission vault's channel cells, the timelock's spend cap and the
+     * treasury router's lines and caps (2026-10-13). Steps are a quarter of
+     * each range: channel 0 - 10,000; spend cap 0 - 200; operations 2,000 -
+     * 3,500; DAO 4,000 - 6,500; liquidity 1,000 - 2,500; Qurrl dispatch 0 -
+     * 2,000; Cushion dispatch 0 - 5,000 (Treasury-Flows §3, tier 2).
+     */
+    function _allocationRule(bytes32 k) private pure returns (uint64, uint256) {
+        if (k == T_ARK_SPEND_CAP) return (D30, 50);
+        if (k == T_OPERATIONS_LINE || k == T_LIQUIDITY_LINE) return (D14, 375);
+        if (k == T_DAO_LINE) return (D14, 625);
+        if (k == T_QURRL_DISPATCH_CAP) return (D14, 500);
+        if (k == T_CUSHION_DISPATCH_CAP) return (D14, 1250);
+        for (uint8 p = 0; p < 5; p++) {
+            if (
+                k == phaseKey("emissionStaking", p) || k == phaseKey("emissionAcorn", p)
+                    || k == phaseKey("emissionGovernance", p) || k == phaseKey("emissionLiquidity", p)
+            ) return (D30, 2500);
+        }
+        return (0, 0);
+    }
+
+    /**
+     * Every per-phase key (field, at sign, phase) of `QurrlPhaseMinter` (contracts/qurrl), 14 days,
+     * no step: the minter checks every bound and relation on its draft, and its
+     * prices already move only within compiled bounds. Computed, not listed:
+     * seventy constants would add nothing a reader could check.
+     */
+    function _qurrlRule(bytes32 k) private pure returns (uint64, uint256) {
+        for (uint8 p = 0; p < 5; p++) {
+            if (
+                k == phaseKey("acornCap", p) || k == phaseKey("qrlCap", p) || k == phaseKey("fusionCap", p)
+                    || k == phaseKey("reqPts", p) || k == phaseKey("reqPtsMin", p) || k == phaseKey("reqPtsMax", p)
+                    || k == phaseKey("mintFee", p) || k == phaseKey("mintFeeMin", p) || k == phaseKey("mintFeeMax", p)
+                    || k == phaseKey("fusionFee", p) || k == phaseKey("walletLimit", p)
+                    || k == phaseKey("mintDuration", p) || k == phaseKey("fusionDuration", p)
+                    || k == phaseKey("lockBaseFee", p)
+            ) return (D14, 0);
+        }
+        return (0, 0);
+    }
+
+    /// keccak256 of the field name, an at sign and the phase digit (the per-phase key form).
+    function phaseKey(bytes memory field, uint8 p) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(field, "@", bytes1(uint8(48) + p)));
     }
 
     /**

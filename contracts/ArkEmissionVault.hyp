@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: MIT
+pragma hyperion >=0.0.1;
+
+import "./lib/openzeppelin/token/ERC20/IERC20.hyp";
+import "./lib/openzeppelin/security/ReentrancyGuard.hyp";
+import "./lib/openzeppelin/utils/cryptography/MerkleProof.hyp";
+
+import "./interfaces/IArkEmissionVault.hyp";
+import "./interfaces/IArkPhase.hyp";
+import "./interfaces/IVeArk.hyp";
+import "./utils/ArkGovTables.hyp";
+import "./utils/QuantumErrors.hyp";
+
+/**
+ * ArkEmissionVault — the community-incentive bucket and its schedule
+ * (`ArkAllocation-Design.md` §5, §6; deltas 2 and the Genesis campaign of
+ * 2026-10-13). See IArkEmissionVault for the rules a claimant sees.
+ *
+ * WHAT IS FIXED AND WHAT IS GOVERNED
+ * ----------------------------------
+ * Fixed (G12, no key): the yearly amounts, the 52-epoch year, the 2.5 lock
+ * bonus, the campaign pool and its windows, the ambassador vesting. Governed
+ * (ArkGovTables, 30 days, step 2,500): the four channel shares per phase.
+ * Governance also replaces the root publisher (7 days). Nothing else here
+ * moves ARK: every unclaimed unit stays in the vault (§5.1, A11).
+ *
+ * THE CLOCK
+ * ---------
+ * Epochs are `block.timestamp / epochLength`, ArkPhase's clock; the year is
+ * 52 epochs, so a testnet profile with a scaled epoch scales the schedule and
+ * the campaign windows with it. Lock lengths are veARK's own, in real time:
+ * four years (`MAX_LOCK`) for a channel claim, at least `CAMPAIGN_MIN_LOCK`
+ * for a campaign claim.
+ *
+ * TWO ONE-SHOT WIRINGS
+ * --------------------
+ * veARK lists this vault as protocol-owned in its constructor, and this vault
+ * locks through veARK, so one of the two is set after deployment: `setVeArk`,
+ * deployer only, once. The ARK bucket itself arrives by transfer or as the
+ * token's incentives address.
+ */
+contract ArkEmissionVault is IArkEmissionVault, ReentrancyGuard {
+    uint8 public constant STAKING = 0;
+    uint8 public constant ACORN = 1;
+    uint8 public constant GOVERNANCE = 2;
+    uint8 public constant LIQUIDITY = 3;
+    uint8 public constant CAMPAIGN = 4;
+    uint8 public constant RESERVE = 5;
+    uint8 public constant AMBASSADORS = 6;
+
+    uint8 private constant CHANNELS = 4;
+    uint8 private constant PHASES = 5;
+    uint16 private constant BPS = 10000;
+
+    uint256 public constant EPOCHS_PER_YEAR = 52;
+    uint256 public constant YEARS = 5;
+
+    /// The four channels' share of years 1-5 (year 1 net of the 25M campaign, A7).
+    uint256 public constant YEAR1 = 132_500_000 * 10 ** 18;
+    uint256 public constant YEAR2 = 112_500_000 * 10 ** 18;
+    uint256 public constant YEAR3 = 81_000_000 * 10 ** 18;
+    uint256 public constant YEAR4 = 54_000_000 * 10 ** 18;
+    uint256 public constant YEAR5 = 45_000_000 * 10 ** 18;
+
+    uint256 public constant CAMPAIGN_POOL = 25_000_000 * 10 ** 18;
+    uint256 public constant AMBASSADOR_POOL = 3_750_000 * 10 ** 18;
+
+    /// From year 2, liquid pays amount * LIQUID_NUM / LIQUID_DEN (the 2.5 lock bonus).
+    uint256 private constant LIQUID_NUM = 2;
+    uint256 private constant LIQUID_DEN = 5;
+    /// A campaign claim taken liquid pays 2/3 (A9).
+    uint256 private constant CAMPAIGN_LIQUID_NUM = 2;
+    uint256 private constant CAMPAIGN_LIQUID_DEN = 3;
+    uint64 public constant CAMPAIGN_MIN_LOCK = 365 days;
+    /// 120 days at the specification's 7-day epoch; scaled with `epochLength`.
+    uint256 private constant CAMPAIGN_WINDOW_SPEC = 120 days;
+    uint256 private constant SPEC_EPOCH = 7 days;
+    uint256 public constant AMBASSADOR_CLIFF_EPOCHS = 13;
+    uint256 public constant AMBASSADOR_VEST_EPOCHS = 52;
+
+    struct Root {
+        bytes32 root;
+        uint256 total;
+        uint256 claimed;
+    }
+
+    IERC20 public immutable ark;
+    IArkPhase public immutable arkPhase;
+    uint256 public immutable epochLength;
+    uint256 public immutable startEpoch;
+    address private immutable _deployer;
+
+    IVeArk public veArk;
+    address public rootPublisher;
+    address public governance;
+    address public pendingGovernance;
+
+    /// Channel share per phase, bps; each phase sums to 10,000.
+    uint16[4][5] private _shares;
+
+    mapping(uint256 => mapping(uint8 => Root)) private _roots;
+    /// keccak256(epoch, channel, account) => claimed. Private: OC-V3-02.
+    mapping(bytes32 => bool) private _claimed;
+
+    /// CAMPAIGN, RESERVE, AMBASSADORS => root.
+    mapping(uint8 => bytes32) private _campaignRoots;
+    mapping(bytes32 => bool) private _campaignClaimed;
+    mapping(address => uint256) private _released;
+    uint256 public campaignSpent;
+    uint256 public ambassadorReleased;
+
+    constructor(address ark_, address arkPhase_, uint256 epochLength_, uint256 startEpoch_, address publisher_) {
+        if (ark_ == address(0) || arkPhase_ == address(0) || publisher_ == address(0)) revert ZeroAddress();
+        if (epochLength_ == 0) revert EpochLengthZero();
+        ark = IERC20(ark_);
+        arkPhase = IArkPhase(arkPhase_);
+        epochLength = epochLength_;
+        startEpoch = startEpoch_;
+        rootPublisher = publisher_;
+        governance = msg.sender;
+        _deployer = msg.sender;
+        // A2 reference shares in every phase: staking 50, Acorn 20, governance 15, liquidity 15.
+        for (uint8 p = 0; p < PHASES; p++) {
+            _shares[p][STAKING] = 5000;
+            _shares[p][ACORN] = 2000;
+            _shares[p][GOVERNANCE] = 1500;
+            _shares[p][LIQUIDITY] = 1500;
+        }
+    }
+
+    modifier onlyGovernance() {
+        if (msg.sender != governance) revert OnlyGovernance(msg.sender);
+        _;
+    }
+
+    modifier onlyPublisher() {
+        if (msg.sender != rootPublisher) revert NotPublisher(msg.sender);
+        _;
+    }
+
+    function setVeArk(address veArk_) external {
+        if (msg.sender != _deployer) revert NotDeployer(msg.sender);
+        if (address(veArk) != address(0)) revert VeArkAlreadySet();
+        if (veArk_ == address(0)) revert ZeroAddress();
+        veArk = IVeArk(veArk_);
+        emit VeArkSet(veArk_);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Clock and schedule                                                  */
+    /* ------------------------------------------------------------------ */
+
+    function start() public view returns (uint64) {
+        return uint64(startEpoch * epochLength);
+    }
+
+    function currentEpoch() public view returns (uint256) {
+        return block.timestamp / epochLength;
+    }
+
+    function epochAmount(uint256 epoch) public view returns (uint256) {
+        if (epoch < startEpoch) return 0;
+        uint256 year = (epoch - startEpoch) / EPOCHS_PER_YEAR;
+        if (year >= YEARS) return 0;
+        uint256 amount = year == 0 ? YEAR1 : year == 1 ? YEAR2 : year == 2 ? YEAR3 : year == 3 ? YEAR4 : YEAR5;
+        return amount / EPOCHS_PER_YEAR;
+    }
+
+    function budgetOf(uint256 epoch, uint8 channel) public view returns (uint256) {
+        if (channel >= CHANNELS) revert UnknownChannel(channel);
+        uint8 p = arkPhase.phaseAt(epoch);
+        return (epochAmount(epoch) * _shares[p][channel]) / BPS;
+    }
+
+    function shareOf(uint8 phase, uint8 channel) external view returns (uint16) {
+        return _shares[phase][channel];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The four channels                                                   */
+    /* ------------------------------------------------------------------ */
+
+    function setRoot(uint256 epoch, uint8 channel, bytes32 root, uint256 total) external onlyPublisher {
+        if (channel >= CHANNELS) revert UnknownChannel(channel);
+        if (epoch >= currentEpoch()) revert EpochNotClosed(epoch);
+        uint256 budget = budgetOf(epoch, channel);
+        if (budget == 0) revert EpochOutOfSchedule(epoch);
+        Root storage r = _roots[epoch][channel];
+        if (r.root != bytes32(0)) revert RootAlreadySet(epoch, channel);
+        if (root == bytes32(0)) revert ZeroValue();
+        if (total > budget) revert RootOverBudget(total, budget);
+        r.root = root;
+        r.total = total;
+        emit RootSet(epoch, channel, root, total);
+    }
+
+    function rootOf(uint256 epoch, uint8 channel) external view returns (bytes32, uint256, uint256) {
+        Root storage r = _roots[epoch][channel];
+        return (r.root, r.total, r.claimed);
+    }
+
+    function hasClaimed(uint256 epoch, uint8 channel, address account) external view returns (bool) {
+        return _claimed[keccak256(abi.encodePacked(epoch, channel, account))];
+    }
+
+    function claim(uint256 epoch, uint8 channel, uint256 amount, bytes32[] calldata proof, bool lock)
+        external
+        nonReentrant
+    {
+        Root storage r = _roots[epoch][channel];
+        if (r.root == bytes32(0)) revert RootUnset(epoch, channel);
+        bytes32 id = keccak256(abi.encodePacked(epoch, channel, msg.sender));
+        if (_claimed[id]) revert AlreadyClaimed(msg.sender);
+        if (!MerkleProof.verifyCalldata(proof, r.root, _leaf(msg.sender, channel, amount))) revert InvalidProof();
+        if (r.claimed + amount > r.total) revert RootExhausted(r.claimed, amount, r.total);
+        _claimed[id] = true;
+        r.claimed += amount;
+
+        // Year 1 after `start`: the Genesis lock, whatever `lock` says (§6.1, AL6).
+        bool genesis = currentEpoch() < startEpoch + EPOCHS_PER_YEAR;
+        uint256 paid;
+        if (genesis || lock) {
+            paid = amount;
+            _lock(msg.sender, amount, uint64(block.timestamp) + veArk.MAX_LOCK());
+        } else {
+            paid = (amount * LIQUID_NUM) / LIQUID_DEN;
+            _pay(msg.sender, paid);
+        }
+        emit Claimed(msg.sender, epoch, channel, amount, paid, genesis || lock);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* The Genesis campaign                                                */
+    /* ------------------------------------------------------------------ */
+
+    function setCampaignRoot(uint8 channel, bytes32 root) external onlyPublisher {
+        if (channel != CAMPAIGN && channel != RESERVE && channel != AMBASSADORS) revert UnknownChannel(channel);
+        if (_campaignRoots[channel] != bytes32(0)) revert RootAlreadySet(0, channel);
+        if (root == bytes32(0)) revert ZeroValue();
+        _campaignRoots[channel] = root;
+        emit CampaignRootSet(channel, root);
+    }
+
+    function campaignRootOf(uint8 channel) external view returns (bytes32) {
+        return _campaignRoots[channel];
+    }
+
+    function campaignWindow(uint8 channel) public view returns (uint64 opens, uint64 closes) {
+        if (channel != CAMPAIGN && channel != RESERVE) revert UnknownChannel(channel);
+        uint256 window = (CAMPAIGN_WINDOW_SPEC * epochLength) / SPEC_EPOCH;
+        opens = start();
+        closes = uint64(uint256(opens) + (channel == CAMPAIGN ? window : 2 * window));
+    }
+
+    function claimCampaign(uint8 channel, uint256 amount, bytes32[] calldata proof, uint64 unlockTime)
+        external
+        nonReentrant
+    {
+        (uint64 opens, uint64 closes) = campaignWindow(channel);
+        uint64 nowTs = uint64(block.timestamp);
+        if (nowTs < opens || nowTs > closes) revert CampaignClosed(opens, closes, nowTs);
+        bytes32 root = _campaignRoots[channel];
+        if (root == bytes32(0)) revert RootUnset(0, channel);
+        bytes32 id = keccak256(abi.encodePacked(channel, msg.sender));
+        if (_campaignClaimed[id]) revert AlreadyClaimed(msg.sender);
+        if (!MerkleProof.verifyCalldata(proof, root, _leaf(msg.sender, channel, amount))) revert InvalidProof();
+        _spendCampaign(amount);
+        _campaignClaimed[id] = true;
+
+        uint256 paid;
+        if (unlockTime == 0) {
+            paid = (amount * CAMPAIGN_LIQUID_NUM) / CAMPAIGN_LIQUID_DEN;
+            _pay(msg.sender, paid);
+        } else {
+            uint64 minimum = nowTs + CAMPAIGN_MIN_LOCK;
+            if (unlockTime < minimum) revert CampaignLockTooShort(unlockTime, minimum);
+            paid = amount;
+            _lock(msg.sender, amount, unlockTime);
+        }
+        emit CampaignClaimed(msg.sender, channel, amount, paid, unlockTime != 0);
+    }
+
+    function claimVested(uint256 total, bytes32[] calldata proof) external nonReentrant {
+        bytes32 root = _campaignRoots[AMBASSADORS];
+        if (root == bytes32(0)) revert RootUnset(0, AMBASSADORS);
+        if (!MerkleProof.verifyCalldata(proof, root, _leaf(msg.sender, AMBASSADORS, total))) revert InvalidProof();
+        uint256 vested = vestedOf(total);
+        uint256 due = vested - _released[msg.sender];
+        if (due == 0) revert NothingVested(msg.sender);
+        if (ambassadorReleased + due > AMBASSADOR_POOL) {
+            revert CampaignPoolExceeded(ambassadorReleased, due, AMBASSADOR_POOL);
+        }
+        _spendCampaign(due);
+        ambassadorReleased += due;
+        _released[msg.sender] = vested;
+        _pay(msg.sender, due);
+        emit VestedClaimed(msg.sender, total, due);
+    }
+
+    /// Linear over 52 epochs from `startEpoch`, nothing before a 13-epoch cliff.
+    function vestedOf(uint256 total) public view returns (uint256) {
+        uint256 nowEpoch = currentEpoch();
+        if (nowEpoch < startEpoch) return 0;
+        uint256 elapsed = nowEpoch - startEpoch;
+        if (elapsed < AMBASSADOR_CLIFF_EPOCHS) return 0;
+        if (elapsed >= AMBASSADOR_VEST_EPOCHS) return total;
+        return (total * elapsed) / AMBASSADOR_VEST_EPOCHS;
+    }
+
+    function releasedTo(address account) external view returns (uint256) {
+        return _released[account];
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Governance                                                          */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Keyed compare-and-swap over the channel shares. The touched phases are
+     * checked as a whole, so moving one share means moving another in the
+     * same diff.
+     */
+    function setParamsDiff(IArkStakeGovernable.ParamChange[] calldata changes) external onlyGovernance {
+        bool[5] memory touched;
+        for (uint256 i = 0; i < changes.length; i++) {
+            (uint8 p, uint8 c) = _decodeKey(changes[i].key);
+            uint256 current = _shares[p][c];
+            if (current != changes[i].expected) revert ShareMismatch(changes[i].key, changes[i].expected, current);
+            if (changes[i].value > BPS) revert ShareOutOfRange(changes[i].key, changes[i].value);
+            _shares[p][c] = uint16(changes[i].value);
+            touched[p] = true;
+            emit ShareChanged(changes[i].key, current, changes[i].value);
+        }
+        for (uint8 p = 0; p < PHASES; p++) {
+            if (!touched[p]) continue;
+            uint256 sum = uint256(_shares[p][0]) + _shares[p][1] + _shares[p][2] + _shares[p][3];
+            if (sum != BPS) revert SharesNotWhole(p, sum);
+        }
+    }
+
+    function setRootPublisher(address publisher) external onlyGovernance {
+        if (publisher == address(0)) revert ZeroAddress();
+        rootPublisher = publisher;
+        emit RootPublisherSet(publisher);
+    }
+
+    function proposeGovernance(address next) external onlyGovernance {
+        if (next == address(0)) revert ZeroAddress();
+        pendingGovernance = next;
+        emit GovernanceProposed(next);
+    }
+
+    function acceptGovernance() external {
+        if (msg.sender != pendingGovernance) revert NotPendingGovernance(msg.sender);
+        governance = msg.sender;
+        pendingGovernance = address(0);
+        emit GovernanceAccepted(msg.sender);
+    }
+
+    /* ------------------------------------------------------------------ */
+    /* Internals                                                           */
+    /* ------------------------------------------------------------------ */
+
+    function _leaf(address account, uint8 channel, uint256 amount) private pure returns (bytes32) {
+        return keccak256(abi.encodePacked(account, channel, amount));
+    }
+
+    function _spendCampaign(uint256 amount) private {
+        if (campaignSpent + amount > CAMPAIGN_POOL) revert CampaignPoolExceeded(campaignSpent, amount, CAMPAIGN_POOL);
+        campaignSpent += amount;
+    }
+
+    function _lock(address account, uint256 amount, uint64 unlockTime) private {
+        if (!ark.approve(address(veArk), amount)) revert TransferFailed(address(veArk), amount);
+        veArk.lockFor(account, amount, unlockTime);
+    }
+
+    function _pay(address to, uint256 amount) private {
+        if (!ark.transfer(to, amount)) revert TransferFailed(to, amount);
+    }
+
+    function _decodeKey(bytes32 key) private pure returns (uint8 phase, uint8 channel) {
+        for (uint8 p = 0; p < PHASES; p++) {
+            if (key == ArkGovTables.phaseKey("emissionStaking", p)) return (p, STAKING);
+            if (key == ArkGovTables.phaseKey("emissionAcorn", p)) return (p, ACORN);
+            if (key == ArkGovTables.phaseKey("emissionGovernance", p)) return (p, GOVERNANCE);
+            if (key == ArkGovTables.phaseKey("emissionLiquidity", p)) return (p, LIQUIDITY);
+        }
+        revert UnknownShareKey(key);
+    }
+}

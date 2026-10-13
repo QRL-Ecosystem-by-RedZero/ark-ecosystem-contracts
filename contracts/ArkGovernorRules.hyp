@@ -110,7 +110,21 @@ contract ArkGovernorRules {
         // A valuation reporter is replaced as a Q-Day attester is (technical reference §3.3).
         if (kind == K_ATTESTER_SET_CHANGE) {
             return s == ArkGovTables.ADD_ATTESTER || s == ArkGovTables.REMOVE_ATTESTER || s == ArkGovTables.ADD_REPORTER
-                || s == ArkGovTables.REMOVE_REPORTER;
+                || s == ArkGovTables.REMOVE_REPORTER || s == ArkGovTables.SET_ROOT_PUBLISHER
+                || s == ArkGovTables.ADD_DISTRIBUTOR;
+        }
+        // 2026-10-13: the treasury ARK (ArkTimelock checks target and quarterly cap), the router and Qurrl budget.
+        if (kind == K_TREASURY_SPEND) {
+            return s == ArkGovTables.TRANSFER || s == ArkGovTables.SET_OPERATIONS || s == ArkGovTables.PAY_BUDGET;
+        }
+        // Qurrl under the timelock (contracts/qurrl): wiring, rates and the collection admin role. Its
+        // minter keys ride setParamsDiff, voted as every keyed diff is (StakingParameter, 10% / 66%).
+        if (kind == K_QURRL_SEASON) {
+            return s == ArkGovTables.SET_CUSHION_BPS || s == ArkGovTables.SET_TREASURY || s == ArkGovTables.SET_CUSHION
+                || s == ArkGovTables.SET_OWNER || s == ArkGovTables.SET_ACORN_ORACLE || s == ArkGovTables.SET_ACORN_SOURCE
+                || s == ArkGovTables.SET_ROYALTY || s == ArkGovTables.SET_RENDERER || s == ArkGovTables.SET_URIS
+                || s == ArkGovTables.FREEZE || s == ArkGovTables.SEAL_PALETTE || s == ArkGovTables.GRANT_ROLE
+                || s == ArkGovTables.REVOKE_ROLE;
         }
         if (kind == K_RENOUNCE_ADMIN) {
             return s == ArkGovTables.RENOUNCE_GUARDIAN || s == ArkGovTables.HAND_OVER

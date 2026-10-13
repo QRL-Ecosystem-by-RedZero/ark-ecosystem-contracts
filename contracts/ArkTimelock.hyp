@@ -13,6 +13,11 @@ interface IGovernanceAccept {
     function acceptGovernance() external;
 }
 
+/// The one read of the ARK token the spend cap needs.
+interface IArkSupply {
+    function totalSupply() external view returns (uint256);
+}
+
 /**
  * ArkTimelock — `governance` of ArkStakeParams, ArkStakeRegistry and
  * ArkBondDelegation (design §6.1, §6.2, §7).
@@ -143,6 +148,18 @@ interface IGovernanceAccept {
  * The guardian cannot cancel the operation that removes it (`renounceGuardian`)
  * nor an uncontested handover, and it cannot renounce itself: only the S3
  * operation removes it. The proposer and the guardian are distinct accounts.
+ *
+ * THE TREASURY'S ARK (2026-10-13, ArkAllocation-Design §7.1, AL7)
+ * ----------------------------------------------------------------
+ * This contract holds the treasury bucket. `transfer(address,uint256)` is
+ * scheduled only on `arkToken` (named once by the proposer, `setArkToken`),
+ * waits 30 days, is objectable at S1, and executes only while the ARK it
+ * moves in the current quarter (13 epochs) stays within `arkSpendCapBps` of
+ * total supply (reference 50 bps, range 0 - 200). The cap is checked when the
+ * operation is scheduled and booked when it executes, so an operation that
+ * would cross it stays Queued and can run in the next quarter, within grace.
+ * The cap is this contract's own key, changed by a self-operation
+ * `setParamsDiff` like any other keyed diff.
  */
 contract ArkTimelock is IArkTimelock {
     uint64 public constant GRACE_PERIOD = 14 days;
@@ -195,6 +212,27 @@ contract ArkTimelock is IArkTimelock {
     /// The operation that last named each parameter key; a key is pending while that one is Queued (SWAPGOV-04).
     mapping(bytes32 => bytes32) private _keyOp;
 
+    /// Epochs per spending quarter.
+    uint256 public constant QUARTER_EPOCHS = 13;
+    /// Largest admissible `arkSpendCapBps`.
+    uint16 public constant MAX_ARK_SPEND_CAP_BPS = 200;
+    /// The ARK token: the only target a `transfer` operation may name. Set once.
+    address public arkToken;
+    /// Treasury ARK the timelock may move per quarter, in bps of total supply.
+    uint16 public arkSpendCapBps = 50;
+    /// ARK moved in each quarter (`ArkEpoch.current() / QUARTER_EPOCHS`).
+    mapping(uint256 => uint256) private _arkSpent;
+
+    event ArkTokenSet(address arkToken);
+    event ArkSpent(uint256 indexed quarter, address indexed to, uint256 amount, uint256 spentInQuarter);
+    event ArkSpendCapSet(uint16 previousBps, uint16 newBps);
+
+    error TransferTargetNotArk(address target);
+    error ArkSpendCapExceeded(uint256 amount, uint256 spentInQuarter, uint256 cap);
+    error SelfParamUnknown(bytes32 key);
+    error SelfParamMismatch(bytes32 key, uint256 expected, uint256 current);
+    error SelfParamOutOfRange(bytes32 key, uint256 value);
+
     constructor(address proposer_, address guardian_) {
         if (proposer_ == address(0)) revert ZeroAddress();
         // GV-17: the canceller is never the scheduler.
@@ -236,6 +274,11 @@ contract ArkTimelock is IArkTimelock {
             op.queueEpoch = uint64(ArkEpoch.current());
         }
         bytes4 selector = bytes4(payload[:4]);
+        if (selector == ArkGovTables.TRANSFER) {
+            if (target != arkToken || target == address(0)) revert TransferTargetNotArk(target);
+            (, uint256 amount) = abi.decode(payload[4:], (address, uint256));
+            _checkArkSpend(amount);
+        }
         if (selector == ArkGovTables.SET_PARAMS_DIFF) _lockKeys(opId, payload);
         if (selector == ArkGovTables.SET_THREAT_STAGE) {
             // One Queued stage step per target (OC-GOV-02): steps run in sequence, each its own delay.
@@ -297,6 +340,9 @@ contract ArkTimelock is IArkTimelock {
 
         op.state = uint8(OpState.Executed);
         if (op.stageStep) _uncountStageStep(_stageKey(op));
+        if (op.target == arkToken && op.payload.length >= 68 && _selectorOf(op.payload) == ArkGovTables.TRANSFER) {
+            _bookArkSpend(op.payload);
+        }
         bool ok;
         (ok, result) = op.target.call{value: msg.value}(op.payload);
         if (!ok) revert CallFailed(opId, result);
@@ -480,6 +526,69 @@ contract ArkTimelock is IArkTimelock {
         emit GovernanceAccepted(target, msg.sender);
     }
 
+    /// Names the ARK token once (S1 proposer), the only target a `transfer` operation may name.
+    function setArkToken(address token) external {
+        if (msg.sender != proposer) revert NotProposer(msg.sender);
+        if (arkToken != address(0)) revert AlreadySet(arkToken);
+        if (token == address(0)) revert ZeroAddress();
+        arkToken = token;
+        emit ArkTokenSet(token);
+    }
+
+    /**
+     * The timelock's own keyed diff: `arkSpendCapBps` only, compare-and-swap,
+     * 0 - 200. Only as a self-operation, so its delay and step come from the
+     * same table as every other key.
+     */
+    function setParamsDiff(IArkStakeGovernable.ParamChange[] calldata changes) external {
+        if (msg.sender != address(this)) revert NotProposer(msg.sender);
+        for (uint256 i = 0; i < changes.length; i++) {
+            IArkStakeGovernable.ParamChange calldata c = changes[i];
+            if (c.key != ArkGovTables.T_ARK_SPEND_CAP) revert SelfParamUnknown(c.key);
+            if (c.expected != arkSpendCapBps) revert SelfParamMismatch(c.key, c.expected, arkSpendCapBps);
+            if (c.value > MAX_ARK_SPEND_CAP_BPS) revert SelfParamOutOfRange(c.key, c.value);
+            emit ArkSpendCapSet(arkSpendCapBps, uint16(c.value));
+            arkSpendCapBps = uint16(c.value);
+        }
+    }
+
+    /// ARK the treasury may still move this quarter.
+    function arkSpendRoom() public view returns (uint256) {
+        uint256 cap = (IArkSupply(arkToken).totalSupply() * arkSpendCapBps) / BPS;
+        uint256 spent = _arkSpent[ArkEpoch.current() / QUARTER_EPOCHS];
+        return cap > spent ? cap - spent : 0;
+    }
+
+    function arkSpentIn(uint256 quarter) external view returns (uint256) {
+        return _arkSpent[quarter];
+    }
+
+    function _checkArkSpend(uint256 amount) private view {
+        uint256 room = arkSpendRoom();
+        if (amount > room) {
+            uint256 q = ArkEpoch.current() / QUARTER_EPOCHS;
+            revert ArkSpendCapExceeded(amount, _arkSpent[q], _arkSpent[q] + room);
+        }
+    }
+
+    function _bookArkSpend(bytes memory payload) private {
+        (address to, uint256 amount) = abi.decode(_tail(payload), (address, uint256));
+        _checkArkSpend(amount);
+        uint256 q = ArkEpoch.current() / QUARTER_EPOCHS;
+        uint256 spent = _arkSpent[q] + amount;
+        _arkSpent[q] = spent;
+        emit ArkSpent(q, to, amount, spent);
+    }
+
+    function _selectorOf(bytes memory p) private pure returns (bytes4 s) {
+        s = bytes4(p[0]) | (bytes4(p[1]) >> 8) | (bytes4(p[2]) >> 16) | (bytes4(p[3]) >> 24);
+    }
+
+    function _tail(bytes memory p) private pure returns (bytes memory out) {
+        out = new bytes(p.length - 4);
+        for (uint256 i = 4; i < p.length; i++) out[i - 4] = p[i];
+    }
+
     function delayFor(bytes calldata payload) external pure returns (uint64 delay) {
         (delay,) = _delayOf(payload);
     }
@@ -565,7 +674,7 @@ contract ArkTimelock is IArkTimelock {
         } else if (
             selector == ArkGovTables.HAND_OVER || selector == ArkGovTables.PROPOSE_GOVERNANCE
                 || selector == ArkGovTables.SET_OBJECTION_SOURCE || selector == ArkGovTables.SET_COURT
-                || selector == ArkGovTables.PAUSE
+                || selector == ArkGovTables.PAUSE || ArkGovTables.isObjectableAllocation(selector)
         ) {
             // The handover ends the S1 chamber: objectable like a value transfer (SWAPGOV-03).
             // So does what hands a governed contract to another governance, or sets a

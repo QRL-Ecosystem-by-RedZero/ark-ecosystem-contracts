@@ -85,13 +85,13 @@ const ABI_DIR = PROFILED ? null : path.join(ROOT, QRVM ? 'abi-qrvm' : 'abi');
 /** What the v3 build compiles: the governance stack, the token it locks, and their imports. */
 const QRVM_ROOTS = [
   'ArkToken.hyp', 'VeArk.hyp', 'ArkTimelock.hyp', 'ArkMultisig.hyp', 'ArkGovernorRules.hyp',
-  'ArkGovernor.hyp', 'ArkQDayOracle.hyp', 'ArkPhase.hyp', 'ChunkedDeployer.hyp',
+  'ArkGovernor.hyp', 'ArkQDayOracle.hyp', 'ArkPhase.hyp', 'ChunkedDeployer.hyp', 'ArkEmissionVault.hyp', 'ArkTreasuryRouter.hyp',
 ];
 const QRVM_OWN = QRVM_ROOTS.map((f) => f.replace(/\.hyp$/, ''));
 
 /** Our own contracts, as opposed to vendored OpenZeppelin. */
 const OWN = [
-  'ArkToken', 'VeArk', 'ArkTimelock', 'ArkMultisig', 'ArkGovernorRules', 'ArkGovernor', 'ArkQDayOracle', 'ArkPhase', 'ChunkedDeployer',
+  'ArkToken', 'VeArk', 'ArkTimelock', 'ArkMultisig', 'ArkGovernorRules', 'ArkGovernor', 'ArkQDayOracle', 'ArkPhase', 'ChunkedDeployer', 'ArkEmissionVault', 'ArkTreasuryRouter',
 ];
 
 const EIP170_LIMIT = 24576;
